@@ -436,6 +436,8 @@
   #define GPIO_EPIGYNY_TX     GPIO9
   #define GPIO_EPIGYNY_RX     GPIO10
   #define EPIGYNY_GPIO        GPIOA
+  #define FLOW_PORT           GPIOA
+  #define FLOW_IO             GPIO5
 
   #define SPEAKER_TIM_RCC     RCC_TIM2
   #define SPEAKER_GPIO_RCC    RCC_GPIOB
