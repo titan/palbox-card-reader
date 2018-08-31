@@ -1,0 +1,371 @@
+#+STARTUP: indent
+* 上位机
+** 框架
+#+begin_src c :tangle /dev/shm/card-reader/epigyny.h
+  #ifndef __EPIGYNY_H
+  #define __EPIGYNY_H
+  #include <stdint.h>
+  #include "ring.h"
+
+  extern volatile uint32_t epigyny_idle_tick;
+
+  extern struct ring_t epigyny_tx;
+  extern struct ring_t epigyny_rx;
+
+  void epigyny_setup(void);
+  void epigyny_eventloop(void);
+  void epigyny_ping(void);
+  void epigyny_card_lock_off(uint32_t card, uint32_t door);
+  void epigyny_token_lock_off(int token);
+
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/card-reader/epigyny.c
+  #include <libopencm3/stm32/rcc.h>
+  #include <libopencm3/stm32/usart.h>
+  #include <libopencm3/cm3/nvic.h>
+  #include "epigyny.h"
+  #include "defination.h"
+  #include "packet.h"
+  #include "utility.h"
+  #include "ring.h"
+  #include "card-reader-fsm.h"
+  #include "led.h"
+  #include "speaker.h"
+  #include "proto-fsm.h"
+
+  #define EPIGYNY_BUFFER_BITSIZE 6
+  #define PACKET_LENGTHS_BUFFER_BITSIZE 3
+
+  struct ring_t epigyny_tx;
+  uint8_t epigyny_tx_buffer[2 << (EPIGYNY_BUFFER_BITSIZE - 1)];
+
+  struct ring_t epigyny_rx;
+  uint8_t epigyny_rx_buffer[2 << (EPIGYNY_BUFFER_BITSIZE - 1)];
+
+  <<proto-context>>
+
+  static struct proto_context_t context;
+  static uint32_t proto_state;
+
+  static uint32_t epigyny_idle_timer = 0;
+  static uint8_t tx_to_send = 0;
+  static volatile uint32_t slot = 0; // indicate what's the right time to send packets
+  <<card-lock-off>>
+  <<token-lock-off>>
+  <<setup>>
+  <<main-loop>>
+  <<proto-callback>>
+  <<proto-fsm>>
+  <<isr>>
+#+end_src
+
+** 设置
+#+begin_src c :noweb-ref setup
+  void epigyny_setup() {
+
+    ring_init(&epigyny_tx, epigyny_tx_buffer, EPIGYNY_BUFFER_BITSIZE);
+    ring_init(&epigyny_rx, epigyny_rx_buffer, EPIGYNY_BUFFER_BITSIZE);
+
+    rcc_periph_clock_enable(RCC_EPIGYNY);
+    rcc_periph_clock_enable(RCC_EPIGYNY_GPIO);
+
+    gpio_mode_setup(EPIGYNY_GPIO, GPIO_MODE_AF, GPIO_PUPD_NONE, GPIO_EPIGYNY_TX);
+    gpio_mode_setup(EPIGYNY_GPIO, GPIO_MODE_AF, GPIO_PUPD_NONE, GPIO_EPIGYNY_RX);
+
+    gpio_set_af(EPIGYNY_GPIO, GPIO_AF1, GPIO_EPIGYNY_TX);
+    gpio_set_af(EPIGYNY_GPIO, GPIO_AF1, GPIO_EPIGYNY_RX);
+
+    /* Setup UART parameters. */
+    usart_set_baudrate(USART_EPIGYNY, 9600);
+    usart_set_databits(USART_EPIGYNY, 8);
+    usart_set_stopbits(USART_EPIGYNY, USART_STOPBITS_1);
+    usart_set_mode(USART_EPIGYNY, USART_MODE_TX_RX);
+    usart_set_parity(USART_EPIGYNY, USART_PARITY_NONE);
+    usart_set_flow_control(USART_EPIGYNY, USART_FLOWCONTROL_NONE);
+
+    /* Enable LOCK Receive interrupt. */
+    USART_CR1(USART_EPIGYNY) |= USART_CR1_RXNEIE;
+
+    /* Finally enable the USART. */
+    usart_enable(USART_EPIGYNY);
+
+    nvic_enable_irq(NVIC_EPIGYNY_IRQ);
+  }
+#+end_src
+** 主循环
+#+begin_src c :noweb-ref main-loop
+  void epigyny_eventloop(void) {
+    if (systick > epigyny_idle_timer) { // 5 seconds
+      led_off();
+      card_reader_state = card_reader_transform_state(card_reader_state, CARD_READER_OFFLINE_EVENT, NULL);
+      epigyny_idle_timer = systick + 4999; // 5 seconds
+    }
+
+    if (tx_to_send == 0) {
+      if (ring_length(&epigyny_tx) > 1) {
+        // saved length as varint type
+        uint32_t len = 0;
+        uint8_t byte = 0;
+        uint8_t count = 0;
+        ring_read(&epigyny_tx, &byte);
+        while (byte > 127 && ring_length(&epigyny_tx) > 0) {
+          ring_read(&epigyny_tx, &byte);
+          len |= (byte & 0x7F) << (count * 7);
+          count ++;
+        }
+        len |= (byte & 0x7F) << (count * 7);
+
+        tx_to_send = len;
+      }
+    } else if (systick >= slot && systick <= (slot + SLOT_LEN - (tx_to_send << 1))) {
+      USART_CR1(USART_EPIGYNY) |= USART_CR1_TXEIE;
+    }
+
+    if (ring_length(&epigyny_rx) > 0) {
+      struct proto_context_t * ctx = &context;
+      ctx->rx_timer = systick;
+      if (ctx->countdown <= 0xFF) {
+        ctx->countdown --;
+      }
+      uint8_t byte;
+      ring_read(&epigyny_rx, &byte);
+      ctx->byte = byte;
+      if (byte < 0x5A) {
+        proto_state = proto_transform_state(proto_state, PROTO_0X00_0X59_EVENT, ctx);
+      } else if (byte == 0x5A) {
+        proto_state = proto_transform_state(proto_state, PROTO_0X5A_EVENT, ctx);
+      } else if (0x5A < byte && byte < 0xA5) {
+        proto_state = proto_transform_state(proto_state, PROTO_0X5B_0XA4_EVENT, ctx);
+      } else if (byte == 0xA5) {
+        proto_state = proto_transform_state(proto_state, PROTO_0XA5_EVENT, ctx);
+      } else if (0xA5 < byte) {
+        proto_state = proto_transform_state(proto_state, PROTO_0XA6_0XFF_EVENT, ctx);
+      }
+      if (ctx->countdown == 0) {
+        proto_state = proto_transform_state(proto_state, PROTO_COUNTDOWN_EQUALS_0_EVENT, ctx);
+      }
+      if (ctx->rx_timer != 0xFFFFFFFF && (systick - ctx->rx_timer > 499)) { // 500 ms
+        proto_state = proto_transform_state(proto_state, PROTO_EOI_EVENT, ctx);
+        ctx->rx_timer = 0xFFFFFFFF;
+      }
+    }
+  }
+#+end_src
+** 协议状态机
+#+begin_src c :noweb-ref proto-fsm
+  void proto_do_action(enum PROTO_ACTION action, void * data) {
+    struct proto_context_t * ctx = (struct proto_context_t *) data;
+    switch (action) {
+    case PROTO_APPEND_ACTION:
+      ctx->buf[ctx->ptr ++] = ctx->byte;
+      break;
+    case PROTO_CLEAR_ACTION:
+      bzero(ctx, sizeof(struct proto_context_t));
+      ctx->countdown = (uint32_t) 0xFFFFFFFF;
+      break;
+    case PROTO_APPEND_COMMA_SET_COUNTDOWN_ACTION:
+      ctx->buf[ctx->ptr ++] = ctx->byte;
+      ctx->len = ctx->byte;
+      ctx->countdown = ctx->byte;
+      break;
+    case PROTO_CALLBACK_ACTION:
+      epigyny_callback(ctx->buf, ctx->ptr);
+      bzero(ctx, sizeof(struct proto_context_t));
+      ctx->countdown = (uint32_t) 0xFFFFFFFF;
+      break;
+    }
+  }
+#+end_src
+** 协议解析上下文
+解析上下文里要存放在解析过程中用到的临时数据。
+| name      | type   |                                                                                 |
+|-----------+--------+---------------------------------------------------------------------------------|
+| buf       | [byte] | 解析过程中使用的缓冲区                                                          |
+| ptr       | uint32 | 记录可用缓冲区的位置                                                            |
+| byte      | byte   | 解析的当前数据                                                                  |
+| type      | byte   | 数据包的类型                                                                    |
+| len       | byte   | 数据包的长度
+| countdown | uint32 | 剩余应读取内容的长度。为 0 时产生 countdown = 0 事件。                          |
+| rx_timer  | uint32 | 最后一次接收到数据的时间戳。当前事件与 rx_timer 差异大于 1000 时，产生 EOF 事件 |
+
+#+begin_src c :noweb-ref proto-context
+  struct proto_context_t {
+    uint8_t buf[512];
+    uint32_t ptr;
+    uint8_t byte;
+    uint8_t type;
+    uint8_t len;
+    uint32_t countdown;
+    uint32_t rx_timer;
+  };
+#+end_src
+
+** 协议回调
+#+begin_src c :noweb-ref proto-callback
+  static void epigyny_callback(uint8_t * buf, uint32_t size) {
+
+    if (buf[6] == 0xFF) {
+      slot = systick + SLOT_LEN * CARD_READER_ID;
+
+      uint32_t len = packet_estimate_decode_size(buf, size);
+      uint8_t tmp[len];
+      bzero(tmp, len);
+      struct packet_t * packet = (struct packet_t *) &tmp;
+      uint32_t dev_type = packet_decode(buf, size, len, packet);
+
+      if (dev_type != COMMON) {
+        return;
+      }
+
+      if (packet->dev_type == COMMON) {
+        if (packet->payload.common.online == 0) {
+          led_off();
+          card_reader_state = card_reader_transform_state(card_reader_state, CARD_READER_OFFLINE_EVENT, NULL);
+        } else {
+          led_on();
+          card_reader_state = card_reader_transform_state(card_reader_state, CARD_READER_ONLINE_EVENT, NULL);
+        }
+        epigyny_idle_timer = systick + 4999; // 5 seconds
+      }
+
+      return;
+    }
+
+    if ((buf[6] & 0x80) == 0) {
+      // it's not from epigyny
+      return;
+    }
+
+    slot = systick + SLOT_LEN * CARD_READER_ID;
+
+    if ((buf[6] & 0x70) != CARD_READER) {
+      // it's not my device type, skip it
+      return;
+    }
+
+    if ((buf[6] & 0x0F) != CARD_READER_ID && (buf[6] & 0x0F) != 0x0F) {
+      // it's not my packet, skip it
+      return;
+    }
+
+    uint32_t len = packet_estimate_decode_size(buf, size);
+    uint8_t tmp[len];
+    bzero(tmp, len);
+    struct packet_t * packet = (struct packet_t *) &tmp;
+    uint32_t dev_type = packet_decode(buf, size, len, packet);
+    if (dev_type != CARD_READER) {
+      return;
+    }
+    switch (packet->payload.card_reader.cmd) {
+    case PING:
+      break;
+    case ONLINE:
+      led_on();
+      card_reader_state = card_reader_transform_state(card_reader_state, CARD_READER_ONLINE_EVENT, NULL);
+      break;
+    case OFFLINE:
+      led_off();
+      card_reader_state = card_reader_transform_state(card_reader_state, CARD_READER_OFFLINE_EVENT, NULL);
+      break;
+    case PLAY:
+      speaker_play((uint16_t) packet->payload.card_reader.audio);
+      card_reader_state = card_reader_transform_state(card_reader_state, CARD_READER_PLAY_EVENT, NULL);
+      break;
+    case VOLUME_UP:
+      break;
+    case VOLUME_DOWN:
+      break;
+    case VOLUME:
+      if (packet->payload.card_reader.volume > 31)
+        packet->payload.card_reader.volume = 31;
+      speaker_volume(packet->payload.card_reader.volume);
+      break;
+    case ERROR:
+      break;
+    case BLOCK: {
+      uint8_t delay = 10;
+      card_reader_state = card_reader_transform_state(card_reader_state, CARD_READER_BLOCK_EVENT, (uint8_t *)&delay);
+      break;
+    }
+    default:
+      break;
+    }
+    epigyny_idle_timer = systick + 4999; // 5 seconds
+  }
+#+end_src
+** 中断响应
+#+begin_src c :noweb-ref isr
+  void USART_EPIGYNY_ISR(void) {
+    uint8_t data = 0;
+    uint32_t result = 0;
+
+    /* Check if we were called because of RXNE. */
+    if (((USART_CR1(USART_EPIGYNY) & USART_CR1_RXNEIE) != 0) && ((USART_ISR(USART_EPIGYNY) & USART_ISR_RXNE) != 0)) {
+
+      /* Retrieve the data from the peripheral. */
+      data = usart_recv(USART_EPIGYNY);
+      ring_write(&epigyny_rx, data);
+
+      if (ring_available(&epigyny_rx) == 0) {
+          /* Disable the RXNEIE interrupt */
+        USART_CR1(USART_EPIGYNY) &= ~USART_CR1_RXNEIE;
+      }
+    }
+
+    /* Check if we were called because of TXE. */
+    if (((USART_CR1(USART_EPIGYNY) & USART_CR1_TXEIE) != 0) && ((USART_ISR(USART_EPIGYNY) & USART_ISR_TXE) != 0)) {
+      if (tx_to_send == 0) {
+        USART_CR1(USART_EPIGYNY) &= ~USART_CR1_TXEIE;
+        return;
+      }
+
+      result = ring_read(&epigyny_tx, &data);
+
+      if (result == 0) {
+        tx_to_send = 0;
+        /* Disable the TXE interrupt, it's no longer needed. */
+        USART_CR1(USART_EPIGYNY) &= ~USART_CR1_TXEIE;
+      } else {
+        /* Put data into the transmit register. */
+        usart_send(USART_EPIGYNY, data);
+        tx_to_send --;
+      }
+    }
+  }
+#+end_src
+** 刷卡开锁
+#+begin_src c :noweb-ref card-lock-off
+  void epigyny_card_lock_off(uint32_t card, uint32_t door) {
+    struct packet_t packet;
+    bzero(&packet, sizeof(struct packet_t));
+    packet.dev_type = CARD_READER;
+    packet.devid = CARD_READER_ID;
+    packet.payload.card_reader.reader_id = CARD_READER_ID;
+    packet.payload.card_reader.cmd = CARD_LOCK_OFF;
+    packet.payload.card_reader.sn = sn ++;
+    packet.payload.card_reader.card = card;
+    if (door < 256) {
+      packet.payload.card_reader.door = door;
+    } else {
+      packet.payload.card_reader.long_door = door;
+    }
+
+    populate_packet_to_tx(&packet, &epigyny_tx);
+  }
+#+end_src
+** Token开锁
+#+begin_src c :noweb-ref token-lock-off
+  void epigyny_token_lock_off(int token) {
+    struct packet_t packet;
+    bzero(&packet, sizeof(struct packet_t));
+    packet.dev_type = CARD_READER;
+    packet.devid = CARD_READER_ID;
+    packet.payload.card_reader.reader_id = CARD_READER_ID;
+    packet.payload.card_reader.cmd = TOKEN_LOCK_OFF;
+    packet.payload.card_reader.sn = sn ++;
+    packet.payload.card_reader.token = token;
+
+    populate_packet_to_tx(&packet, &epigyny_tx);
+  }
+#+end_src

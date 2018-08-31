@@ -1,0 +1,483 @@
+#+STARTUP: indent
+* 辅助代码
+** hash
+#+begin_src c :tangle /dev/shm/card-reader/hash.h
+  #ifndef __HASH_H
+  #define __HASH_H
+  #include <stdint.h>
+
+  uint8_t crc8(uint8_t * buf, uint32_t size);
+  uint32_t adler32(uint8_t * buf, uint32_t size);
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/card-reader/hash.c
+  #include "hash.h"
+
+  #define CRC8_KEY 0x07
+
+  uint8_t crc8(uint8_t * buf, uint32_t size) {
+    uint8_t crc = 0;
+    while (size-- != 0) {
+      for (uint8_t i = 0x80; i != 0; i /= 2) {
+        if ((crc & 0x80) != 0) {
+          crc = crc << 1;
+          crc ^= CRC8_KEY;
+        } else {
+          crc = crc << 1;
+        }
+        if (( * buf & i) != 0) {
+          crc ^= CRC8_KEY;
+        }
+      }
+      buf ++;
+    }
+    return crc;
+  }
+
+  uint32_t adler32(uint8_t * buf, uint32_t size) {
+    uint32_t a = 1, b = 0;
+    for (uint8_t i = 0; i < size; i ++) {
+      uint8_t d = buf[i];
+      a = (a + d) % 66521;
+      b = (a + b) % 66521;
+    }
+    return (b << 16) | a;
+  }
+#+end_src
+** ring
+#+begin_src c :tangle /dev/shm/card-reader/ring.h
+  #ifndef __RING_H
+  #define __RING_H
+  #include <stdint.h>
+  struct ring_t {
+    uint8_t * data;
+    uint32_t head;
+    uint32_t tail;
+    uint32_t mask;
+  };
+
+  #define ring_length(r) ((r)->tail - (r)->head)
+
+  #define ring_is_empty(r) ((r)->head == (r)->tail)
+
+  #define ring_empty(r) do {  \
+      (r)->head = 0;          \
+      (r)->tail = 0;          \
+    } while(0)
+
+  #define ring_available(r) ((r)->mask + 1 - ring_length(r))
+
+  void ring_init(struct ring_t * ring, uint8_t * data, uint32_t bitsize);
+  uint32_t ring_write(struct ring_t * ring, uint8_t data);
+  uint32_t ring_write_array(struct ring_t * ring, uint8_t * data, uint32_t offset, uint32_t size);
+  uint32_t ring_read(struct ring_t * ring, uint8_t * data);
+  uint32_t ring_read_array(struct ring_t * ring, uint8_t * data, uint32_t offset, uint32_t size);
+  uint32_t ring_pop(struct ring_t * ring, uint32_t size);
+  uint32_t ring_at(struct ring_t * ring, uint32_t index, uint8_t * data);
+  int32_t ring_find(struct ring_t * ring, uint8_t * data, uint32_t size, int32_t * position);
+  int32_t ring_find_in(struct ring_t * ring, uint32_t start, uint32_t stop, uint8_t * data, uint32_t size, int32_t * position);
+  uint32_t ring_copy(struct ring_t * ring, uint32_t start, uint32_t stop, uint8_t * buf, uint32_t size, uint32_t * count);
+
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/card-reader/ring.c
+  #include "ring.h"
+
+  #define MIN(a, b) ((a) < (b) ? (a) : (b))
+
+  void ring_init(struct ring_t * ring, uint8_t * data, uint32_t bitsize) {
+    ring->data = data;
+    ring->head = 0;
+    ring->tail = 0;
+    ring->mask = (2 << (bitsize - 1)) - 1;
+  }
+
+  uint32_t ring_write(struct ring_t * ring, uint8_t data) {
+    if (ring_available(ring) == 0) {
+      return 0;
+    }
+    ring->data[ring->tail & ring->mask] = data;
+    ring->tail += 1;
+    return 1;
+  }
+
+  uint32_t ring_write_array(struct ring_t * ring, uint8_t * data, uint32_t offset, uint32_t size) {
+    uint32_t cnt = 0;
+    while (ring_available(ring) > 0 && cnt < size) {
+      ring->data[ring->tail & ring->mask] = data[offset + cnt];
+      ring->tail += 1;
+      cnt ++;
+    }
+    return cnt;
+  }
+
+  uint32_t ring_read(struct ring_t * ring, uint8_t * data) {
+    if (ring_is_empty(ring)) {
+      return 0;
+    }
+
+    ,* data = ring->data[ring->head & ring->mask];
+    ring->head += 1;
+    return 1;
+  }
+
+  uint32_t ring_read_array(struct ring_t * ring, uint8_t * data, uint32_t offset, uint32_t size) {
+    uint32_t cnt = 0;
+    while (!ring_is_empty(ring) && cnt < size) {
+      data[offset + cnt] = ring->data[ring->head & ring->mask];
+      ring->head += 1;
+      cnt ++;
+    }
+    return cnt;
+  }
+
+  uint32_t ring_pop(struct ring_t * ring, uint32_t size) {
+    uint32_t cnt = 0;
+    while (!ring_is_empty(ring) && cnt < size) {
+      ring->head += 1;
+      cnt ++;
+    }
+    return cnt;
+  }
+
+  uint32_t ring_at(struct ring_t * ring, uint32_t index, uint8_t * data) {
+    if (ring_length(ring) <= index) {
+      return 0;
+    }
+
+    ,* data = ring->data[(ring->head + index) & ring->mask];
+    return 1;
+  }
+
+  int32_t ring_find(struct ring_t * ring, uint8_t * data, uint32_t size, int32_t * position) {
+    int32_t offset = -1;
+    int32_t found;
+    uint32_t ringlen = ring_length(ring);
+    if (size > ringlen) {
+      return -1;
+    }
+    int32_t len = ringlen - size + 1;
+    uint32_t head = ring->head;
+    for (int32_t i = 0; i < len; i ++) {
+      found = 1;
+      for (uint32_t j = 0; j < size; j ++) {
+        if (ring->data[(head + i + j) & ring->mask] != data[j]) {
+          found = 0;
+          break;
+        }
+      }
+      if (found == 1) {
+        offset = i;
+        break;
+      }
+    }
+    if (position != 0) {
+      ,* position = offset;
+    }
+    return offset;
+  }
+
+  int32_t ring_find_in(struct ring_t * ring, uint32_t start, uint32_t stop, uint8_t * data, uint32_t size, int32_t * position) {
+    int32_t offset = -1;
+    int32_t found;
+    uint32_t ringlen = ring_length(ring);
+    if (size > ringlen) {
+      return -1;
+    }
+    if (stop > ringlen) {
+      stop = ringlen;
+    }
+    if (stop - start < size) {
+      return -1;
+    }
+    int32_t len = stop - size - start + 1;
+    uint32_t head = ring->head;
+    for (int32_t i = 0; i < len; i ++) {
+      found = 1;
+      for (uint32_t j = 0; j < size; j ++) {
+        if (ring->data[(head + start + i + j) & ring->mask] != data[j]) {
+          found = 0;
+          break;
+        }
+      }
+      if (found == 1) {
+        offset = i + start;
+        break;
+      }
+    }
+    if (position != 0) {
+      ,* position = offset;
+    }
+    return offset;
+  }
+
+  uint32_t ring_copy(struct ring_t * ring, uint32_t start, uint32_t stop, uint8_t * buf, uint32_t size, uint32_t * count) {
+    uint32_t cnt = 0;
+    uint32_t ringlen = ring_length(ring);
+    /*
+    if (size > ringlen) {
+      return 0;
+    }
+    ,*/
+    if (stop > ringlen) {
+      stop = ringlen;
+    }
+    if (stop - start > size) {
+      return 0;
+    }
+    uint32_t head = ring->head;
+    for (uint32_t i = 0; i < MIN(size, stop - start); i ++, cnt ++) {
+      buf[cnt] = ring->data[(head + start + i) & ring->mask];
+    }
+    if (count != 0) {
+      ,* count = cnt;
+    }
+    return cnt;
+  }
+#+end_src
+** utility
+#+begin_src c :tangle /dev/shm/card-reader/utility.h
+  #ifndef _UTILITY_H
+  #define _UTILITY_H
+  #include <stdint.h>
+
+  void delay(uint32_t ms);
+  void delay_us(uint32_t us);
+  uint8_t uint_to_char(uint32_t num, char buf[10]);
+  uint32_t char_to_uint(char * buf, uint32_t size);
+  void bzero(void * base, uint32_t size);
+  uint8_t encode_decimal(uint8_t num);
+  uint8_t encode_hex(uint8_t num);
+
+  void srand(uint32_t seed);
+  uint32_t rand(void);
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/card-reader/utility.c
+  #include "utility.h"
+  #include "defination.h"
+
+  void delay(uint32_t ms) {
+    ms *= 960; // 3360=168MHz, 1440=72MHz
+    while (ms--) {
+      __asm ("nop");
+    }
+  }
+
+  void delay_us(uint32_t us) {
+    while (us--) {
+      for (uint8_t i = 0; i < 10; i ++) {
+        __asm ("nop");
+      }
+    }
+  }
+
+  uint8_t uint_to_char(uint32_t num, char buf[10]) {
+    for (int i = 0; i < 10; i ++) {
+      buf[i] = 0;
+    }
+    if (num == 0) {
+      buf[0] = '0';
+      return 1;
+    }
+
+    uint8_t ptr = 0;
+    while (num != 0) {
+      buf[ptr ++] = (num % 10) + 0x30;
+      num /= 10;
+    }
+    for (uint32_t i = 0, len = ptr / 2; i < len; i ++) {
+      char tmp = buf[i];
+      buf[i] = buf[ptr - i - 1];
+      buf[ptr - i - 1] = tmp;
+    }
+    return ptr;
+  }
+
+  uint32_t char_to_uint(char * buf, uint32_t size) {
+    uint32_t num = 0;
+    for (uint32_t i = 0; i < size; i ++) {
+      num *= 10;
+      switch (buf[i]) {
+      case '0':
+      case '1':
+      case '2':
+      case '3':
+      case '4':
+      case '5':
+      case '6':
+      case '7':
+      case '8':
+      case '9':
+        num += buf[i] - 0x30;
+      }
+    }
+    return num;
+  }
+
+  void bzero(void * base, uint32_t size) {
+    uint32_t end = (uint32_t)base + size;
+    while ((uint32_t)base != end) {
+      ,*(uint8_t *) base = 0;
+      base ++;
+    }
+  }
+
+  uint8_t encode_decimal(uint8_t num) {
+    switch (num) {
+    case 0: return CHAR_0;
+    case 1: return CHAR_1;
+    case 2: return CHAR_2;
+    case 3: return CHAR_3;
+    case 4: return CHAR_4;
+    case 5: return CHAR_5;
+    case 6: return CHAR_6;
+    case 7: return CHAR_7;
+    case 8: return CHAR_8;
+    case 9: return CHAR_9;
+    default: return CHAR_BLANK;
+    }
+  }
+
+  uint8_t encode_hex(uint8_t num) {
+    switch (num) {
+    case 0x00: return CHAR_0;
+    case 0x01: return CHAR_1;
+    case 0x02: return CHAR_2;
+    case 0x03: return CHAR_3;
+    case 0x04: return CHAR_4;
+    case 0x05: return CHAR_5;
+    case 0x06: return CHAR_6;
+    case 0x07: return CHAR_7;
+    case 0x08: return CHAR_8;
+    case 0x09: return CHAR_9;
+    case 0x0A: return CHAR_A;
+    case 0x0B: return CHAR_B;
+    case 0x0C: return CHAR_C;
+    case 0x0D: return CHAR_D;
+    case 0x0E: return CHAR_E;
+    case 0x0F: return CHAR_F;
+    default: return CHAR_BLANK;
+    }
+  }
+
+  static uint32_t randseed;
+  void srand(uint32_t seed) {
+    randseed = seed;
+  }
+
+  uint32_t rand(void) {
+    uint32_t r = randseed = randseed * 1103515245 + 12345;
+    return (r << 16) | ((r >> 16) & 0xFFFF);
+  }
+#+end_src
+** 宏定义
+#+begin_src c :tangle /dev/shm/card-reader/defination.h
+  #ifndef __DEFINATION_H
+  #define __DEFINATION_H
+  #include <libopencm3/stm32/gpio.h>
+
+  #define WIEGAND_RCC         RCC_GPIOA
+  #define WIEGAND_PORT        GPIOA
+  #define WIEGAND_IO0         GPIO0
+  #define WIEGAND_IO1         GPIO1
+
+  #ifdef TM1637
+  #include "tm1637.h"
+
+  #define TM1637_RCC          RCC_GPIOA
+  #define TM1637_PORT         GPIOA
+  #define TM1637_CLK          GPIO3
+  #define TM1637_DIO          GPIO2
+
+  #define segment_led_display(seg, data) do {     \
+      tm1637_display(seg, data);                  \
+    } while (0)
+
+  #define segment_led_display6(data) do {         \
+      tm1637_display6(data);                      \
+    } while (0)
+
+  #define segment_led_setup() do { tm1637_setup(); } while (0)
+  #define keyboard_scan_key() tm1637_scan_key()
+
+  #endif
+
+  #ifdef TM1650
+  #include "tm1650.h"
+
+  #define TM1650_RCC          RCC_GPIOA
+  #define TM1650_PORT         GPIOA
+  #define TM1650_CLK          GPIO2
+  #define TM1650_DIO          GPIO3
+
+  #define segment_led_display(seg, data) do {     \
+      tm1650_display(seg, data);                  \
+    } while (0)
+
+  #define segment_led_display4(data) do {         \
+      tm1650_display4(data);                      \
+    } while (0)
+
+  #define segment_led_setup() do { tm1650_setup(); } while (0)
+  #define keyboard_scan_key() 0
+
+  #endif
+
+  #define LED_RCC             RCC_GPIOA
+  #define LED_PORT            GPIOA
+  #define LED_IO              GPIO4
+
+  #define USART_EPIGYNY       USART1
+  #define USART_EPIGYNY_ISR   usart1_isr
+  #define RCC_EPIGYNY         RCC_USART1
+  #define RCC_EPIGYNY_GPIO    RCC_GPIOA
+  #define NVIC_EPIGYNY_IRQ    NVIC_USART1_IRQ
+  #define GPIO_EPIGYNY_TX     GPIO9
+  #define GPIO_EPIGYNY_RX     GPIO10
+  #define EPIGYNY_GPIO        GPIOA
+
+  #define SPEAKER_TIM_RCC     RCC_TIM2
+  #define SPEAKER_GPIO_RCC    RCC_GPIOB
+  #define SPEAKER_TIM         TIM2
+  #define SPEAKER_TIM_RST     RST_TIM2
+  #define SPEAKER_PORT        GPIOB
+  #define SPEAKER_IO          GPIO1
+  #define SPEAKER_NVIC_IRQ    NVIC_TIM2_IRQ
+
+  #define NULL                0
+
+  #define ON                  1
+  #define OFF                 0
+
+  #define MIN(a, b) ((a) < (b) ? (a) : (b))
+
+  enum CHAR {
+    CHAR_0 = 0x3f,
+    CHAR_1 = 0x06,
+    CHAR_2 = 0x5b,
+    CHAR_3 = 0x4f,
+    CHAR_4 = 0x66,
+    CHAR_5 = 0x6d,
+    CHAR_6 = 0x7d,
+    CHAR_7 = 0x07,
+    CHAR_8 = 0x7f,
+    CHAR_9 = 0x6f,
+    CHAR_A = 0x77,
+    CHAR_B = 0x7c,
+    CHAR_C = 0x39,
+    CHAR_D = 0x5e,
+    CHAR_E = 0x79,
+    CHAR_F = 0x71,
+    CHAR_BLANK = 0x00
+  };
+
+  extern uint8_t uid[12];
+
+  extern volatile uint32_t card_reader_state;
+  extern volatile uint32_t sn;
+  extern volatile uint32_t systick;
+
+
+  #endif
+#+end_src

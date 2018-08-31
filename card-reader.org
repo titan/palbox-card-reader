@@ -1,0 +1,7 @@
+#+TITLE: The core application for card-reader based on STM32F030
+#+AUTHOR: Titan
+#+EMAIL: howay.tan@fengchaohuzhu.com
+#+DATE: <2018-08-31 Fri>
+#+KEYWORDS: stm32, cortex m0, card-reader
+#+OPTIONS: H:4 toc:t
+#+STARTUP: indent

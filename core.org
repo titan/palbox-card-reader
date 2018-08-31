@@ -1,0 +1,625 @@
+#+STARTUP: indent
+* 核心功能
+** 代码框架
+#+begin_src c :tangle /dev/shm/card-reader/card-reader.c
+  #include <libopencm3/stm32/iwdg.h>
+  #include <libopencm3/stm32/rcc.h>
+  #include <libopencm3/cm3/nvic.h>
+  #include <libopencm3/cm3/systick.h>
+  #include "defination.h"
+  #include "ring.h"
+  #include "utility.h"
+  #include "led.h"
+  #include "wiegand.h"
+  #include "epigyny.h"
+  #include "speaker.h"
+  #include "card-reader-fsm.h"
+
+  #ifdef TM1637
+  #include "tm1637.h"
+  #endif
+
+  #ifdef TM1650
+  #include "tm1650.h"
+  #endif
+
+  static uint32_t card_no;
+  static uint32_t number = 0;
+  static uint8_t number1 = 0;
+  static uint8_t number2 = 0;
+  static uint8_t number3 = 0;
+  static uint8_t number4 = 0;
+  static uint8_t number5 = 0;
+  static uint8_t number6 = 0;
+  static uint8_t card_countdown = 0;
+  static uint8_t block_countdown = 0;
+  static uint8_t token_locking_off_countdown = 0;
+  static uint8_t token_input_countdown = 0;
+  static uint32_t request_timer = 0;
+
+  #ifdef TM1637
+  static const uint8_t blanks[6] = { CHAR_BLANK, CHAR_BLANK, CHAR_BLANK, CHAR_BLANK, CHAR_BLANK, CHAR_BLANK };
+  static const uint8_t fulls[6] = { CHAR_8, CHAR_8, CHAR_8, CHAR_8, CHAR_8, CHAR_8 };
+  #else
+  static const uint8_t blanks[4] = { CHAR_BLANK, CHAR_BLANK, CHAR_BLANK, CHAR_BLANK };
+  static const uint8_t fulls[4] = { CHAR_8, CHAR_8, CHAR_8, CHAR_8 };
+  #endif
+
+  volatile uint32_t card_reader_state = CARD_READER_OFFLINE_STATE;
+  volatile uint32_t sn = 0;
+  volatile uint32_t systick = 0;
+
+  uint8_t uid[12];
+
+  void sys_tick_handler(void) {
+    systick ++;
+  }
+
+  <<setup>>
+  <<main-loop>>
+  <<fsm>>
+#+end_src
+** 设置
+#+begin_src c :noweb-ref setup
+  static void setup(void) {
+
+    uint32_t id[3];
+    id[0] = *(uint32_t*)(0x1ffff7ac);
+    id[1] = *(uint32_t*)(0x1ffff7b0);
+    id[2] = *(uint32_t*)(0x1ffff7b4);
+
+    uid[0] = (uint8_t)(id[0] & 0x000000FF);
+    uid[1] = (uint8_t)((id[0] & 0x0000FF00) >> 8);
+    uid[2] = (uint8_t)((id[0] & 0x00FF0000) >> 16);
+    uid[3] = (uint8_t)((id[0] & 0xFF000000) >> 24);
+    uid[4] = (uint8_t)(id[1] & 0x000000FF);
+    uid[5] = (uint8_t)((id[1] & 0x0000FF00) >> 8);
+    uid[6] = (uint8_t)((id[1] & 0x00FF0000) >> 16);
+    uid[7] = (uint8_t)((id[1] & 0xFF000000) >> 24);
+    uid[8] = (uint8_t)(id[2] & 0x000000FF);
+    uid[9] = (uint8_t)((id[2] & 0x0000FF00) >> 8);
+    uid[10] = (uint8_t)((id[2] & 0x00FF0000) >> 16);
+    uid[11] = (uint8_t)((id[2] & 0xFF000000) >> 24);
+
+  #if CRYSTAL == ON
+    rcc_clock_setup_in_hse_8mhz_out_48mhz();
+  #else
+    rcc_clock_setup_in_hsi_out_48mhz();
+  #endif
+
+    /* 48MHz => 48000000 counts per second */
+    systick_set_clocksource(STK_CSR_CLKSOURCE_AHB);
+
+    /* 48,000,000/48,000 = 1000 overflows per second - every 1ms one interrupt */
+    /* SysTick interrupt every N clock pulses: set reload to N-1 */
+    systick_set_reload(47999);
+    systick_interrupt_enable();
+    systick_counter_enable();
+
+    led_setup();
+    wiegand_setup();
+    segment_led_setup();
+    epigyny_setup();
+    //iwdg_set_period_ms(30000);
+    //iwdg_start();
+    srand(CARD_READER_ID);
+    speaker_setup();
+  }
+#+end_src
+** 主循环
+#+begin_src c :noweb-ref main-loop
+  int main(void) {
+
+    setup();
+
+    for (uint8_t i = 0; i < 3; i ++) {
+  #ifdef TM1637
+      segment_led_display6(fulls);
+      delay(1000);
+      segment_led_display6(blanks);
+      delay(1000);
+  #else
+      segment_led_display4(fulls);
+      delay(1000);
+      segment_led_display4(blanks);
+      delay(1000);
+  #endif
+    }
+
+    speaker_volume(25);
+
+    uint32_t loop_timer = 0;
+
+    while (1) {
+      epigyny_eventloop();
+      wiegand_eventloop();
+      speaker_eventloop();
+      if (systick - loop_timer > 999) {
+        loop_timer = systick;
+        if (card_reader_state == CARD_READER_REQUESTING_STATE) {
+          if (systick - request_timer > 2999) {
+            card_reader_state = card_reader_transform_state(card_reader_state, CARD_READER_TIMEOUT_EVENT, NULL);
+          }
+        } else if (card_reader_state == CARD_READER_BLOCKED_STATE) {
+          if (block_countdown == 0) {
+            card_reader_state = card_reader_transform_state(card_reader_state, CARD_READER_TIMEOUT_EVENT, NULL);
+          }
+        } else if (card_reader_state == CARD_READER_CARD_READ_STATE ||
+                   card_reader_state == CARD_READER_CARD_NUMBER_1_INPUTED_STATE ||
+                   card_reader_state == CARD_READER_CARD_NUMBER_2_INPUTED_STATE ||
+                   card_reader_state == CARD_READER_CARD_NUMBER_3_INPUTED_STATE ||
+                   card_reader_state == CARD_READER_CARD_NUMBER_4_INPUTED_STATE) {
+          if (card_countdown == 0) {
+            card_reader_state = card_reader_transform_state(card_reader_state, CARD_READER_TIMEOUT_EVENT, NULL);
+          }
+        } else if (card_reader_state == CARD_READER_TOKEN_NUMBER_1_INPUTED_WHEN_OFFLINE_STATE ||
+                   card_reader_state == CARD_READER_TOKEN_NUMBER_2_INPUTED_WHEN_OFFLINE_STATE ||
+                   card_reader_state == CARD_READER_TOKEN_NUMBER_3_INPUTED_WHEN_OFFLINE_STATE ||
+                   card_reader_state == CARD_READER_TOKEN_NUMBER_4_INPUTED_WHEN_OFFLINE_STATE ||
+                   card_reader_state == CARD_READER_TOKEN_NUMBER_5_INPUTED_WHEN_OFFLINE_STATE ||
+                   card_reader_state == CARD_READER_TOKEN_NUMBER_1_INPUTED_WHEN_STANDBY_STATE ||
+                   card_reader_state == CARD_READER_TOKEN_NUMBER_2_INPUTED_WHEN_STANDBY_STATE ||
+                   card_reader_state == CARD_READER_TOKEN_NUMBER_3_INPUTED_WHEN_STANDBY_STATE ||
+                   card_reader_state == CARD_READER_TOKEN_NUMBER_4_INPUTED_WHEN_STANDBY_STATE ||
+                   card_reader_state == CARD_READER_TOKEN_NUMBER_5_INPUTED_WHEN_STANDBY_STATE) {
+          if (token_input_countdown == 0) {
+            card_reader_state = card_reader_transform_state(card_reader_state, CARD_READER_TIMEOUT_EVENT, NULL);
+          }
+        } else if (card_reader_state == CARD_READER_TOKEN_LOCKING_OFF_WHEN_OFFLINE_STATE ||
+                   card_reader_state == CARD_READER_TOKEN_LOCKING_OFF_WHEN_STANDBY_STATE) {
+          if (token_locking_off_countdown == 0) {
+            card_reader_state = card_reader_transform_state(card_reader_state, CARD_READER_TIMEOUT_EVENT, NULL);
+          }
+        }
+        if (((systick / 1000) & 0x01) == 0) {
+          card_reader_state = card_reader_transform_state(card_reader_state, CARD_READER_YIN_TICK_EVENT, NULL);
+        } else {
+          card_reader_state = card_reader_transform_state(card_reader_state, CARD_READER_YANG_TICK_EVENT, NULL);
+        }
+      }
+    }
+
+    return 0;
+  }
+#+end_src
+** 状态机
+#+begin_src c :noweb-ref fsm
+  void card_reader_do_action(enum CARD_READER_ACTION action, void * data) {
+    switch (action) {
+    case CARD_READER_CLEAR_LED_ACTION:
+  #ifdef TM1637
+      segment_led_display6(blanks);
+  #else
+      segment_led_display4(blanks);
+  #endif
+      break;
+    case CARD_READER_SHOW_OFFLINE_ACTION:
+      break;
+    case CARD_READER_BLOCK_COUNTDOWN_ASSIGN_TO_10_ACTION:
+  #ifdef TM1637
+      segment_led_display6(blanks);
+  #else
+      segment_led_display4(blanks);
+  #endif
+      block_countdown = 10;
+      break;
+    case CARD_READER_PLAY_OFFLINE_ACTION:
+      speaker_play(15); // say offline notification to customer
+      break;
+    case CARD_READER_NUMBER_1_ASSIGN_TO_NUMBER_NEWLINE_TOKEN_INPUT_COUNTDOWN_ASSIGN_TO_30_ACTION:
+      number1 = * (uint8_t *) data;
+  #ifdef TM1637
+      segment_led_display(6, encode_decimal(number1));
+  #else
+      segment_led_display(4, encode_decimal(number1));
+  #endif
+      token_input_countdown = 30;
+      break;
+    case CARD_READER_CLEAR_LED_NEWLINE_NUMBER_1_ASSIGN_TO_NUMBER_NEWLINE_TOKEN_INPUT_COUNTDOWN_ASSIGN_TO_30_ACTION:
+      number1 = * (uint8_t *) data;
+  #ifdef TM1637
+      segment_led_display6(blanks);
+      segment_led_display(6, encode_decimal(number1));
+  #else
+      segment_led_display4(blanks);
+      segment_led_display(4, encode_decimal(number1));
+  #endif
+      token_input_countdown = 30;
+      break;
+    case CARD_READER_SAVE_CARD_NEWLINE_CARD_COUNTDOWN_ASSIGN_TO_30_ACTION:
+      card_no = * (uint32_t *) data;
+      number = 0;
+      number1 = 0;
+      number2 = 0;
+      number3 = 0;
+      number4 = 0;
+      number5 = 0;
+      number6 = 0;
+      speaker_play(2); // say welcome to customer
+      card_countdown = 30;
+      break;
+    case CARD_READER_SHOW_REQUEST_TIMER_ACTION:
+      segment_led_display(1, encode_decimal(((systick - request_timer) / 1000) / 10));
+      segment_led_display(2, encode_decimal(((systick - request_timer) / 1000) % 10));
+      break;
+    case CARD_READER_DECREASE_BLOCK_COUNTDOWN_NEWLINE_SHOW_BLOCK_COUNTDOWN_ACTION:
+      block_countdown --;
+      segment_led_display(1, encode_decimal(block_countdown / 10));
+      segment_led_display(2, encode_decimal(block_countdown % 10));
+      break;
+    case CARD_READER_NUMBER_1_ASSIGN_TO_NUMBER_NEWLINE_PLAY_AUDIO_ACTION:
+      number1 = * (uint8_t *) data;
+  #ifdef TM1637
+      segment_led_display(6, encode_decimal(number1));
+  #else
+      segment_led_display(4, encode_decimal(number1));
+  #endif
+      speaker_play(number1 + 30);
+      break;
+    case CARD_READER_CARD_LOCK_OFF_NEWLINE_START_REQUEST_TIMER_ACTION:
+      request_timer = systick;
+      number = number4 * 1000 + number3 * 100 + number2 * 10 + number1;
+      number1 = 0;
+      number2 = 0;
+      number3 = 0;
+      number4 = 0;
+      number5 = 0;
+      number6 = 0;
+  #ifdef TM1637
+      segment_led_display6(blanks);
+  #else
+      segment_led_display4(blanks);
+  #endif
+      epigyny_card_lock_off(card_no, number);
+      speaker_play(3); // tell customers to wait a while
+      number = 0;
+      break;
+    case CARD_READER_DECREASE_CARD_COUNTDOWN_NEWLINE_SHOW_CARD_COUNTDOWN_NEWLINE_CLEAR_CURSOR_ACTION:
+      card_countdown --;
+      segment_led_display(1, encode_decimal(card_countdown / 10));
+      segment_led_display(2, encode_decimal(card_countdown % 10));
+      if (card_reader_state == CARD_READER_CARD_READ_STATE) {
+  #ifdef TM1637
+        segment_led_display(3, CHAR_BLANK);
+        segment_led_display(4, CHAR_BLANK);
+        segment_led_display(5, CHAR_BLANK);
+        segment_led_display(6, CHAR_BLANK);
+  #else
+        segment_led_display(3, CHAR_BLANK);
+        segment_led_display(4, CHAR_BLANK);
+  #endif
+      } else if (card_reader_state == CARD_READER_CARD_NUMBER_1_INPUTED_STATE) {
+  #ifdef TM1637
+        segment_led_display(3, CHAR_BLANK);
+        segment_led_display(4, CHAR_BLANK);
+        segment_led_display(5, CHAR_BLANK);
+  #else
+        segment_led_display(3, CHAR_BLANK);
+  #endif
+      } else if (card_reader_state == CARD_READER_CARD_NUMBER_2_INPUTED_STATE) {
+  #ifdef TM1637
+        segment_led_display(3, CHAR_BLANK);
+        segment_led_display(4, CHAR_BLANK);
+  #else
+  #endif
+      } else if (card_reader_state == CARD_READER_CARD_NUMBER_3_INPUTED_STATE) {
+  #ifdef TM1637
+        segment_led_display(3, CHAR_BLANK);
+  #else
+  #endif
+      }
+      break;
+    case CARD_READER_DECREASE_CARD_COUNTDOWN_NEWLINE_SHOW_CARD_COUNTDOWN_NEWLINE_SHOW_CURSOR_ACTION:
+      card_countdown --;
+      if (card_reader_state == CARD_READER_CARD_READ_STATE) {
+  #ifdef TM1637
+        segment_led_display(3, 0x40);
+        segment_led_display(4, 0x40);
+        segment_led_display(5, 0x40);
+        segment_led_display(6, 0x40);
+  #else
+        segment_led_display(3, 0x40);
+        segment_led_display(4, 0x40);
+  #endif
+      } else if (card_reader_state == CARD_READER_CARD_NUMBER_1_INPUTED_STATE) {
+  #ifdef TM1637
+        segment_led_display(3, 0x40);
+        segment_led_display(4, 0x40);
+        segment_led_display(5, 0x40);
+  #else
+        segment_led_display(3, 0x40);
+  #endif
+      } else if (card_reader_state == CARD_READER_CARD_NUMBER_2_INPUTED_STATE) {
+  #ifdef TM1637
+        segment_led_display(3, 0x40);
+        segment_led_display(4, 0x40);
+  #else
+  #endif
+      } else if (card_reader_state == CARD_READER_CARD_NUMBER_3_INPUTED_STATE) {
+  #ifdef TM1637
+        segment_led_display(3, 0x40);
+  #else
+  #endif
+      }
+      segment_led_display(1, encode_decimal(card_countdown / 10));
+      segment_led_display(2, encode_decimal(card_countdown % 10));
+      break;
+    case CARD_READER_NUMBER_2_ASSIGN_TO_NUMBER_1_NEWLINE_NUMBER_1_ASSIGN_TO_NUMBER_NEWLINE_PLAY_AUDIO_ACTION:
+      number2 = number1;
+      number1 = * (uint8_t *) data;
+  #ifdef TM1637
+      segment_led_display(5, encode_decimal(number2));
+      segment_led_display(6, encode_decimal(number1));
+  #else
+      segment_led_display(3, encode_decimal(number2));
+      segment_led_display(4, encode_decimal(number1));
+  #endif
+      speaker_play(number1 + 30);
+      break;
+    case CARD_READER_NUMBER_1_ASSIGN_TO_0_ACTION:
+      number1 = 0;
+  #ifdef TM1637
+      segment_led_display(6, CHAR_BLANK);
+  #else
+      segment_led_display(4, CHAR_BLANK);
+  #endif
+      break;
+    case CARD_READER_NUMBER_3_ASSIGN_TO_NUMBER_2_NEWLINE_NUMBER_2_ASSIGN_TO_NUMBER_1_NEWLINE_NUMBER_1_ASSIGN_TO_NUMBER_NEWLINE_PLAY_AUDIO_ACTION:
+      number3 = number2;
+      number2 = number1;
+      number1 = * (uint8_t *) data;
+  #ifdef TM1637
+      segment_led_display(4, encode_decimal(number3));
+      segment_led_display(5, encode_decimal(number2));
+      segment_led_display(6, encode_decimal(number1));
+  #else
+      segment_led_display(3, encode_decimal(number2));
+      segment_led_display(4, encode_decimal(number1));
+  #endif
+      speaker_play(number1 + 30);
+      break;
+    case CARD_READER_NUMBER_1_ASSIGN_TO_NUMBER_2_NEWLINE_NUMBER_2_ASSIGN_TO_0_NEWLINE_ACTION:
+      number1 = number2;
+      number2 = 0;
+  #ifdef TM1637
+      segment_led_display(5, CHAR_BLANK);
+      segment_led_display(6, encode_decimal(number1));
+  #else
+      segment_led_display(3, CHAR_BLANK);
+      segment_led_display(4, encode_decimal(number1));
+  #endif
+      break;
+    case CARD_READER_NUMBER_4_ASSIGN_TO_NUMBER_3_NEWLINE_NUMBER_3_ASSIGN_TO_NUMBER_2_NEWLINE_NUMBER_2_ASSIGN_TO_NUMBER_1_NEWLINE_NUMBER_1_ASSIGN_TO_NUMBER_NEWLINE_PLAY_AUDIO_ACTION:
+      number4 = number3;
+      number3 = number2;
+      number2 = number1;
+      number1 = * (uint8_t *) data;
+  #ifdef TM1637
+      segment_led_display(3, encode_decimal(number4));
+      segment_led_display(4, encode_decimal(number3));
+      segment_led_display(5, encode_decimal(number2));
+      segment_led_display(6, encode_decimal(number1));
+  #else
+      segment_led_display(3, encode_decimal(number2));
+      segment_led_display(4, encode_decimal(number1));
+  #endif
+      speaker_play(number1 + 30);
+      break;
+    case CARD_READER_NUMBER_1_ASSIGN_TO_NUMBER_2_NEWLINE_NUMBER_2_ASSIGN_TO_NUMBER_3_NEWLINE_NUMBER_3_ASSIGN_TO_0_NEWLINE_ACTION:
+      number1 = number2;
+      number2 = number3;
+      number3 = 0;
+  #ifdef TM1637
+      segment_led_display(4, CHAR_BLANK);
+      segment_led_display(5, encode_decimal(number2));
+      segment_led_display(6, encode_decimal(number1));
+  #else
+      segment_led_display(3, encode_decimal(number2));
+      segment_led_display(4, encode_decimal(number1));
+  #endif
+      break;
+    case CARD_READER_NUMBER_1_ASSIGN_TO_NUMBER_2_NEWLINE_NUMBER_2_ASSIGN_TO_NUMBER_3_NEWLINE_NUMBER_3_ASSIGN_TO_NUMBER_4_NEWLINE_NUMBER_4_ASSIGN_TO_0_NEWLINE_ACTION:
+      number1 = number2;
+      number2 = number3;
+      number3 = number4;
+      number4 = 0;
+  #ifdef TM1637
+      segment_led_display(3, CHAR_BLANK);
+      segment_led_display(4, encode_decimal(number3));
+      segment_led_display(5, encode_decimal(number2));
+      segment_led_display(6, encode_decimal(number1));
+  #else
+      segment_led_display(3, encode_decimal(number2));
+      segment_led_display(4, encode_decimal(number1));
+  #endif
+      break;
+    case CARD_READER_NUMBER_2_ASSIGN_TO_NUMBER_1_NEWLINE_NUMBER_1_ASSIGN_TO_NUMBER_NEWLINE_TOKEN_INPUT_COUNTDOWN_ASSIGN_TO_30_ACTION:
+      number2 = number1;
+      number1 = * (uint8_t *) data;
+  #ifdef TM1637
+      segment_led_display(5, encode_decimal(number2));
+      segment_led_display(6, encode_decimal(number1));
+  #else
+      segment_led_display(3, encode_decimal(number2));
+      segment_led_display(4, encode_decimal(number1));
+  #endif
+      token_input_countdown = 30;
+      break;
+    case CARD_READER_NUMBER_1_ASSIGN_TO_0_NEWLINE_TOKEN_INPUT_COUNTDOWN_ASSIGN_TO_30_ACTION:
+      number1 = 0;
+  #ifdef TM1637
+      segment_led_display(6, CHAR_BLANK);
+  #else
+      segment_led_display(4, CHAR_BLANK);
+  #endif
+      token_input_countdown = 30;
+      break;
+    case CARD_READER_DECREASE_TOKEN_INPUT_COUNTDOWN_ACTION:
+      token_input_countdown --;
+      break;
+    case CARD_READER_NUMBER_3_ASSIGN_TO_NUMBER_2_NEWLINE_NUMBER_2_ASSIGN_TO_NUMBER_1_NEWLINE_NUMBER_1_ASSIGN_TO_NUMBER_NEWLINE_TOKEN_INPUT_COUNTDOWN_ASSIGN_TO_30_ACTION:
+      number3 = number2;
+      number2 = number1;
+      number1 = * (uint8_t *) data;
+  #ifdef TM1637
+      segment_led_display(4, encode_decimal(number3));
+      segment_led_display(5, encode_decimal(number2));
+      segment_led_display(6, encode_decimal(number1));
+  #else
+      segment_led_display(2, encode_decimal(number3));
+      segment_led_display(3, encode_decimal(number2));
+      segment_led_display(4, encode_decimal(number1));
+  #endif
+      token_input_countdown = 30;
+      break;
+    case CARD_READER_NUMBER_1_ASSIGN_TO_NUMBER_2_NEWLINE_NUMBER_2_ASSIGN_TO_0_NEWLINE_TOKEN_INPUT_COUNTDOWN_ASSIGN_TO_30_ACTION:
+      number1 = number2;
+      number2 = 0;
+  #ifdef TM1637
+      segment_led_display(5, CHAR_BLANK);
+      segment_led_display(6, encode_decimal(number1));
+  #else
+      segment_led_display(3, CHAR_BLANK);
+      segment_led_display(4, encode_decimal(number1));
+  #endif
+      token_input_countdown = 30;
+      break;
+    case CARD_READER_NUMBER_4_ASSIGN_TO_NUMBER_3_NEWLINE_NUMBER_3_ASSIGN_TO_NUMBER_2_NEWLINE_NUMBER_2_ASSIGN_TO_NUMBER_1_NEWLINE_NUMBER_1_ASSIGN_TO_NUMBER_NEWLINE_TOKEN_INPUT_COUNTDOWN_ASSIGN_TO_30_ACTION:
+      number4 = number3;
+      number3 = number2;
+      number2 = number1;
+      number1 = * (uint8_t *) data;
+  #ifdef TM1637
+      segment_led_display(3, encode_decimal(number4));
+      segment_led_display(4, encode_decimal(number3));
+      segment_led_display(5, encode_decimal(number2));
+      segment_led_display(6, encode_decimal(number1));
+  #else
+      segment_led_display(1, encode_decimal(number4));
+      segment_led_display(2, encode_decimal(number3));
+      segment_led_display(3, encode_decimal(number2));
+      segment_led_display(4, encode_decimal(number1));
+  #endif
+      token_input_countdown = 30;
+      break;
+    case CARD_READER_NUMBER_1_ASSIGN_TO_NUMBER_2_NEWLINE_NUMBER_2_ASSIGN_TO_NUMBER_3_NEWLINE_NUMBER_3_ASSIGN_TO_0_NEWLINE_TOKEN_INPUT_COUNTDOWN_ASSIGN_TO_30_ACTION:
+      number1 = number2;
+      number2 = number3;
+      number3 = 0;
+  #ifdef TM1637
+      segment_led_display(4, CHAR_BLANK);
+      segment_led_display(5, encode_decimal(number2));
+      segment_led_display(6, encode_decimal(number1));
+  #else
+      segment_led_display(2, CHAR_BLANK);
+      segment_led_display(3, encode_decimal(number2));
+      segment_led_display(4, encode_decimal(number1));
+  #endif
+      token_input_countdown = 30;
+      break;
+    case CARD_READER_NUMBER_5_ASSIGN_TO_NUMBER_4_NEWLINE_NUMBER_4_ASSIGN_TO_NUMBER_3_NEWLINE_NUMBER_3_ASSIGN_TO_NUMBER_2_NEWLINE_NUMBER_2_ASSIGN_TO_NUMBER_1_NEWLINE_NUMBER_1_ASSIGN_TO_NUMBER_NEWLINE_TOKEN_INPUT_COUNTDOWN_ASSIGN_TO_30_ACTION:
+      number5 = number4;
+      number4 = number3;
+      number3 = number2;
+      number2 = number1;
+      number1 = * (uint8_t *) data;
+  #ifdef TM1637
+      segment_led_display(2, encode_decimal(number5));
+      segment_led_display(3, encode_decimal(number4));
+      segment_led_display(4, encode_decimal(number3));
+      segment_led_display(5, encode_decimal(number2));
+      segment_led_display(6, encode_decimal(number1));
+  #else
+      segment_led_display(1, encode_decimal(number4));
+      segment_led_display(2, encode_decimal(number3));
+      segment_led_display(3, encode_decimal(number2));
+      segment_led_display(4, encode_decimal(number1));
+  #endif
+      token_input_countdown = 30; // 30 seconds
+      break;
+    case CARD_READER_NUMBER_1_ASSIGN_TO_NUMBER_2_NEWLINE_NUMBER_2_ASSIGN_TO_NUMBER_3_NEWLINE_NUMBER_3_ASSIGN_TO_NUMBER_4_NEWLINE_NUMBER_4_ASSIGN_TO_0_NEWLINE_TOKEN_INPUT_COUNTDOWN_ASSIGN_TO_30_ACTION:
+      number1 = number2;
+      number2 = number3;
+      number3 = number4;
+      number4 = 0;
+  #ifdef TM1637
+      segment_led_display(3, CHAR_BLANK);
+      segment_led_display(4, encode_decimal(number3));
+      segment_led_display(5, encode_decimal(number2));
+      segment_led_display(6, encode_decimal(number1));
+  #else
+      segment_led_display(1, CHAR_BLANK);
+      segment_led_display(2, encode_decimal(number3));
+      segment_led_display(3, encode_decimal(number2));
+      segment_led_display(4, encode_decimal(number1));
+  #endif
+      token_input_countdown = 30; // 30 seconds
+      break;
+    case CARD_READER_NUMBER_6_ASSIGN_TO_NUMBER_5_NEWLINE_NUMBER_5_ASSIGN_TO_NUMBER_4_NEWLINE_NUMBER_4_ASSIGN_TO_NUMBER_3_NEWLINE_NUMBER_3_ASSIGN_TO_NUMBER_2_NEWLINE_NUMBER_2_ASSIGN_TO_NUMBER_1_NEWLINE_NUMBER_1_ASSIGN_TO_NUMBER_NEWLINE_TOKEN_INPUT_COUNTDOWN_ASSIGN_TO_0_NEWLINE_TOKEN_LOCK_OFF_NEWLINE_TOKEN_LOCKING_OFF_COUNTDOWN_ASSIGN_TO_5_ACTION:
+      number6 = number5;
+      number5 = number4;
+      number4 = number3;
+      number3 = number2;
+      number2 = number1;
+      number1 = * (uint8_t *) data;
+  #ifdef TM1637
+      segment_led_display(1, encode_decimal(number6));
+      segment_led_display(2, encode_decimal(number5));
+      segment_led_display(3, encode_decimal(number4));
+      segment_led_display(4, encode_decimal(number3));
+      segment_led_display(5, encode_decimal(number2));
+      segment_led_display(6, encode_decimal(number1));
+  #else
+      segment_led_display(1, encode_decimal(number4));
+      segment_led_display(2, encode_decimal(number3));
+      segment_led_display(3, encode_decimal(number2));
+      segment_led_display(4, encode_decimal(number1));
+  #endif
+
+      number = number6 * 100000 + number5 * 10000 + number4 * 1000 + number3 * 100 + number2 * 10 + number1;
+      number1 = 0;
+      number2 = 0;
+      number3 = 0;
+      number4 = 0;
+      number5 = 0;
+      number6 = 0;
+      epigyny_token_lock_off(number);
+      speaker_play(3); // tell customers to wait a while
+      number = 0;
+
+      token_locking_off_countdown = 5; // for 5 seconds
+      break;
+    case CARD_READER_NUMBER_1_ASSIGN_TO_NUMBER_2_NEWLINE_NUMBER_2_ASSIGN_TO_NUMBER_3_NEWLINE_NUMBER_3_ASSIGN_TO_NUMBER_4_NEWLINE_NUMBER_4_ASSIGN_TO_NUMBER_5_NEWLINE_NUMBER_5_ASSIGN_TO_0_NEWLINE_TOKEN_INPUT_COUNTDOWN_ASSIGN_TO_30_ACTION:
+      number1 = number2;
+      number2 = number3;
+      number3 = number4;
+      number4 = number5;
+      number5 = 0;
+  #ifdef TM1637
+      segment_led_display(2, CHAR_BLANK);
+      segment_led_display(3, encode_decimal(number4));
+      segment_led_display(4, encode_decimal(number3));
+      segment_led_display(5, encode_decimal(number2));
+      segment_led_display(6, encode_decimal(number1));
+  #else
+      segment_led_display(1, encode_decimal(number4));
+      segment_led_display(2, encode_decimal(number3));
+      segment_led_display(3, encode_decimal(number2));
+      segment_led_display(4, encode_decimal(number1));
+  #endif
+      token_input_countdown = 30; // 30 seconds
+      break;
+    case CARD_READER_CLEAR_LED_NEWLINE_START_REQUEST_TIMER_ACTION:
+  #ifdef TM1637
+      segment_led_display6(blanks);
+  #else
+      segment_led_display4(blanks);
+  #endif
+      request_timer = systick;
+      break;
+    case CARD_READER_DECREASE_TOKEN_LOCKING_OFF_COUNTDOWN_ACTION:
+      token_locking_off_countdown --;
+      break;
+    }
+  }
+#+end_src

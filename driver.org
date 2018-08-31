@@ -1,0 +1,696 @@
+#+STARTUP: indent
+*驱动层
+
+** Wiegand
+#+begin_src c :tangle /dev/shm/card-reader/wiegand.h
+  #ifndef _WIEGAND_H
+  #define _WIEGAND_H
+  void wiegand_setup(void);
+  void wiegand_eventloop(void);
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/card-reader/wiegand.c
+  #include <libopencm3/stm32/rcc.h>
+  #include <libopencm3/stm32/gpio.h>
+  #include <libopencm3/cm3/nvic.h>
+  #include <libopencm3/stm32/exti.h>
+  #include "wiegand.h"
+  #include "defination.h"
+  #include "led.h"
+  #include "utility.h"
+
+  #include "wiegand-fsm.h"
+  #include "card-reader-fsm.h"
+
+  static uint8_t received = 0;
+  static uint8_t values[34];
+  static uint32_t wiegand_state = WIEGAND_INITIAL_STATE;
+  static uint32_t timer = 0;
+
+  void wiegand_setup(void) {
+
+    rcc_periph_clock_enable(WIEGAND_RCC);
+
+    nvic_enable_irq(NVIC_EXTI0_1_IRQ);
+
+    gpio_mode_setup(WIEGAND_PORT, GPIO_MODE_INPUT, GPIO_PUPD_PULLUP, WIEGAND_IO0);
+    gpio_mode_setup(WIEGAND_PORT, GPIO_MODE_INPUT, GPIO_PUPD_PULLUP, WIEGAND_IO1);
+
+    exti_select_source(EXTI0, WIEGAND_PORT);
+    exti_select_source(EXTI1, WIEGAND_PORT);
+    exti_set_trigger(EXTI0 | EXTI1, EXTI_TRIGGER_FALLING);
+    exti_reset_request(EXTI0 | EXTI1);
+    exti_enable_request(EXTI0 | EXTI1);
+
+    bzero(values, 34);
+  }
+
+  static void wiegand_reset(void) {
+    received = 0;
+    bzero(values, 34);
+  }
+
+  static void wiegand_verify_26(void) {
+    uint8_t even_count = 0;
+    uint8_t odd_count = 0;
+    for (uint8_t i = 0; i < 13; i ++) {
+      if (values[i] == 1) {
+        even_count ++;
+      }
+    }
+    if ((even_count & 0x01) == 1) {
+      wiegand_state = wiegand_transform_state(wiegand_state, WIEGAND_NOT_VERIFIED_EVENT, NULL);
+      return;
+    }
+
+    for (uint8_t i = 13; i < 26; i ++) {
+      if (values[i] == 1) {
+        odd_count ++;
+      }
+    }
+    if ((odd_count & 0x01) == 0) {
+      wiegand_state = wiegand_transform_state(wiegand_state, WIEGAND_NOT_VERIFIED_EVENT, NULL);
+      return;
+    }
+
+    wiegand_state = wiegand_transform_state(wiegand_state, WIEGAND_VERIFIED_COMMA_RECEIVED_EQUALS_26_EVENT, NULL);
+  }
+
+  static void wiegand_verify_34(void) {
+    uint8_t even_count = 0;
+    uint8_t odd_count = 0;
+    for (uint8_t i = 0; i < 17; i ++) {
+      if (values[i] == 1) {
+        even_count ++;
+      }
+    }
+    if ((even_count & 0x01) == 1) {
+      wiegand_state = wiegand_transform_state(wiegand_state, WIEGAND_NOT_VERIFIED_EVENT, NULL);
+      return;
+    }
+
+    for (uint8_t i = 17; i < 34; i ++) {
+      if (values[i] == 1) {
+        odd_count ++;
+      }
+    }
+    if ((odd_count & 0x01) == 0) {
+      wiegand_state = wiegand_transform_state(wiegand_state, WIEGAND_NOT_VERIFIED_EVENT, NULL);
+      return;
+    }
+
+    wiegand_state = wiegand_transform_state(wiegand_state, WIEGAND_VERIFIED_COMMA_RECEIVED_EQUALS_34_EVENT, NULL);
+  }
+
+  void wiegand_do_action(enum WIEGAND_ACTION action, void * data) {
+    (void)data;
+    switch(action) {
+    case WIEGAND_0_AND_START_TIMER_ACTION:
+      received ++;
+      timer = systick;
+      break;
+    case WIEGAND_1_AND_START_TIMER_ACTION:
+      values[received ++] = 1;
+      timer = systick;
+      break;
+    case WIEGAND_RESET_ACTION:
+      wiegand_reset();
+      break;
+    case WIEGAND_0_ACTION:
+      received ++;
+      break;
+    case WIEGAND_1_ACTION:
+      values[received ++] = 1;
+      break;
+    case WIEGAND_0_AND_VERIFY_34_ACTION:
+      received ++;
+      wiegand_verify_34();
+      break;
+    case WIEGAND_1_AND_VERIFY_34_ACTION:
+      values[received ++] = 1;
+      wiegand_verify_34();
+      break;
+    case WIEGAND_SEND_34_AND_RESET_ACTION: {
+      uint32_t value = 0;
+      for (uint8_t i = 1, times = 34 - 1; i < times; i ++) {
+        value = (value << 1) | values[i];
+      }
+      wiegand_reset();
+      card_reader_state = card_reader_transform_state(card_reader_state, CARD_READER_CARD_EVENT, &value);
+      break;
+    }
+    case WIEGAND_SEND_26_AND_RESET_ACTION: {
+      uint32_t value = 0;
+      for (uint8_t i = 1, times = 26 - 1; i < times; i ++) {
+        value = (value << 1) | values[i];
+      }
+      wiegand_reset();
+      card_reader_state = card_reader_transform_state(card_reader_state, CARD_READER_CARD_EVENT, &value);
+      break;
+    }
+    case WIEGAND_REPORT_ERROR_AND_RESET_ACTION:
+      wiegand_reset();
+      break;
+    case WIEGAND_SEND_4_KEY_AND_RESET_ACTION: {
+      uint8_t key = 0;
+      for (uint8_t i = 0; i < 4; i ++) {
+        key = (key << 1) | values[i];
+      }
+      wiegand_reset();
+      switch (key) {
+      case 0x0A:
+        card_reader_state = card_reader_transform_state(card_reader_state, CARD_READER_ESCAPE_EVENT, NULL);
+        break;
+      case 0x0B:
+        card_reader_state = card_reader_transform_state(card_reader_state, CARD_READER_ENTER_EVENT, NULL);
+        break;
+      default:
+        card_reader_state = card_reader_transform_state(card_reader_state, CARD_READER_NUMBER_EVENT, &key);
+        break;
+      }
+      break;
+    }
+    case WIEGAND_SEND_8_KEY_AND_RESET_ACTION: {
+      uint8_t key = 0;
+      for (uint8_t i = 4; i < 8; i ++) {
+        key = (key << 1) | values[i];
+      }
+      wiegand_reset();
+      switch (key) {
+      case 0x0A:
+        card_reader_state = card_reader_transform_state(card_reader_state, CARD_READER_ESCAPE_EVENT, NULL);
+        break;
+      case 0x0B:
+        card_reader_state = card_reader_transform_state(card_reader_state, CARD_READER_ENTER_EVENT, NULL);
+        break;
+      default:
+        card_reader_state = card_reader_transform_state(card_reader_state, CARD_READER_NUMBER_EVENT, &key);
+        break;
+      }
+      break;
+    }
+    case WIEGAND_VERIFY_26_ACTION:
+      wiegand_verify_26();
+      break;
+    default:
+      break;
+    }
+  }
+
+  void exti0_1_isr(void) {
+    if (exti_get_flag_status(EXTI0)) {
+      exti_reset_request(EXTI0);
+      //console_string("0");
+      if (received == 33) {
+        wiegand_state = wiegand_transform_state(wiegand_state, WIEGAND_0_COMMA_RECEIVED_EQUALS_34_EVENT, NULL); // received(33) + current(1) = 34
+      } else {
+        wiegand_state = wiegand_transform_state(wiegand_state, WIEGAND_0_COMMA_RECEIVED_NOT_EQUALS_34_EVENT, NULL);
+      }
+    }
+    if (exti_get_flag_status(EXTI1)) {
+      exti_reset_request(EXTI1);
+      //console_string("1");
+      if (received == 33) {
+        wiegand_state = wiegand_transform_state(wiegand_state, WIEGAND_1_COMMA_RECEIVED_EQUALS_34_EVENT, NULL); // received(33) + current(1) = 34
+      } else {
+        wiegand_state = wiegand_transform_state(wiegand_state, WIEGAND_1_COMMA_RECEIVED_NOT_EQUALS_34_EVENT, NULL);
+      }
+    }
+  }
+
+  void wiegand_eventloop(void) {
+    if (wiegand_state == WIEGAND_INPUTING_STATE) {
+      if (systick - timer > 255) { // 256 ms
+        if (received == 4) {
+          wiegand_state = wiegand_transform_state(wiegand_state, WIEGAND_TIMEOUT_COMMA_RECEIVED_EQUALS_4_EVENT, NULL);
+        } else if (received == 8) {
+          wiegand_state = wiegand_transform_state(wiegand_state, WIEGAND_TIMEOUT_COMMA_RECEIVED_EQUALS_8_EVENT, NULL);
+        } else if (received == 26) {
+          wiegand_state = wiegand_transform_state(wiegand_state, WIEGAND_TIMEOUT_COMMA_RECEIVED_EQUALS_26_EVENT, NULL);
+        } else {
+          wiegand_state = wiegand_transform_state(wiegand_state, WIEGAND_TIMEOUT_EVENT, NULL);
+        }
+      }
+    }
+  }
+#+end_src
+** 数码管
+*** TM1650
+#+begin_src c :tangle /dev/shm/card-reader/tm1650.h
+  #ifndef _TM1650_H
+  #define _TM1650_H
+  #include <stdint.h>
+
+  void tm1650_setup(void);
+  void tm1650_display(const uint8_t seg, const uint8_t data);
+  void tm1650_display4(const uint8_t data[4]);
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/card-reader/tm1650.c
+  #include <libopencm3/stm32/rcc.h>
+  #include <libopencm3/stm32/gpio.h>
+  #include "tm1650.h"
+  #include "defination.h"
+  #include "utility.h"
+  #include "ring.h"
+
+  #define DATA_BASE  0x40
+  #define DATA_WRITE 0x08
+  #define DATA_READ  0x09
+
+  #define ADDR_0    0x68
+  #define ADDR_1    0x6A
+  #define ADDR_2    0x6C
+  #define ADDR_3    0x6E
+
+  #define DISP_BASE 0x00
+  #define DISP_BRIGHT8  0x00
+  #define DISP_BRIGHT1  (0x01 << 4)
+  #define DISP_BRIGHT2  (0x02 << 4)
+  #define DISP_BRIGHT3  (0x03 << 4)
+  #define DISP_BRIGHT4  (0x04 << 4)
+  #define DISP_BRIGHT5  (0x05 << 4)
+  #define DISP_BRIGHT6  (0x06 << 4)
+  #define DISP_BRIGHT7  (0x07 << 4)
+  #define DISP_SEGMENT_7 0
+  #define DISP_SEGMENT_8 (0x01 << 3)
+  #define DISP_OFF  0x00
+  #define DISP_ON   0x01
+
+  void tm1650_setup() {
+    rcc_periph_clock_enable(TM1650_RCC);
+
+    gpio_mode_setup(TM1650_PORT, GPIO_MODE_OUTPUT, GPIO_PUPD_PULLUP, TM1650_CLK | TM1650_DIO);
+    gpio_set_output_options(TM1650_PORT, GPIO_OTYPE_PP, GPIO_OSPEED_LOW, TM1650_CLK | TM1650_DIO);
+  }
+
+  static void tm1650_start(void) {
+    gpio_set(TM1650_PORT, TM1650_DIO);
+    gpio_set(TM1650_PORT, TM1650_CLK);
+    delay_us(2);
+    gpio_clear(TM1650_PORT, TM1650_DIO);
+  }
+
+  static void tm1650_ack(void) {
+    gpio_clear(TM1650_PORT, TM1650_DIO);
+    delay_us(2);
+    gpio_set(TM1650_PORT, TM1650_CLK);
+    delay_us(2);
+    gpio_clear(TM1650_PORT, TM1650_CLK);
+    delay_us(2);
+  }
+
+  static void tm1650_stop(void) {
+    gpio_clear(TM1650_PORT, TM1650_CLK);
+    delay_us(2);
+    gpio_clear(TM1650_PORT, TM1650_DIO);
+    delay_us(2);
+    gpio_set(TM1650_PORT, TM1650_CLK);
+    delay_us(2);
+    gpio_set(TM1650_PORT, TM1650_DIO);
+  }
+
+  static void tm1650_write(const uint8_t byte) {
+    for (uint8_t i = 0; i < 8; i ++) {
+      gpio_clear(TM1650_PORT, TM1650_CLK);
+      delay_us(2);
+      if (byte & ((0x80) >> i)) {
+        gpio_set(TM1650_PORT, TM1650_DIO);
+      } else {
+        gpio_clear(TM1650_PORT, TM1650_DIO);
+      }
+      delay_us(2);
+      gpio_set(TM1650_PORT, TM1650_CLK);
+      delay_us(2);
+    }
+    gpio_clear(TM1650_PORT, TM1650_CLK);
+    delay_us(2);
+  }
+
+  void tm1650_display(const uint8_t seg, const uint8_t data) {
+    tm1650_start();
+    tm1650_write(DATA_BASE | DATA_WRITE);
+    tm1650_ack();
+    tm1650_write(DISP_BASE | DISP_ON | DISP_BRIGHT5);
+    tm1650_ack();
+    tm1650_stop();
+    tm1650_start();
+    switch (seg) {
+    case 2:
+      tm1650_write(ADDR_1);
+      break;
+    case 3:
+      tm1650_write(ADDR_2);
+      break;
+    case 4:
+      tm1650_write(ADDR_3);
+      break;
+    default:
+      tm1650_write(ADDR_0);
+      break;
+    }
+    tm1650_ack();
+    tm1650_write(data);
+    tm1650_ack();
+    tm1650_stop();
+  }
+
+  void tm1650_display4(const uint8_t data[4]) {
+    uint8_t addr[4] = {ADDR_0, ADDR_1, ADDR_2, ADDR_3};
+    tm1650_start();
+    tm1650_write(DATA_BASE | DATA_WRITE);
+    tm1650_ack();
+    tm1650_write(DISP_BASE | DISP_ON | DISP_BRIGHT5);
+    tm1650_ack();
+    tm1650_stop();
+    for (uint8_t i = 0; i < 4; i ++) {
+      tm1650_start();
+      tm1650_write(addr[i]);
+      tm1650_ack();
+      tm1650_write(data[i]);
+      tm1650_ack();
+      tm1650_stop();
+    }
+  }
+#+end_src
+*** TM1637
+#+begin_src c :tangle /dev/shm/card-reader/tm1637.h
+  #ifndef _TM1637_H
+  #define _TM1637_H
+  #include <stdint.h>
+
+  void tm1637_setup(void);
+  void tm1637_display(const uint8_t seg, const uint8_t data);
+  void tm1637_display6(const uint8_t data[6]);
+  uint8_t tm1637_scan_key(void);
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/card-reader/tm1637.c
+  #include <libopencm3/stm32/rcc.h>
+  #include <libopencm3/stm32/gpio.h>
+  #include "tm1637.h"
+  #include "defination.h"
+  #include "utility.h"
+
+  #define DATA_BASE         0x40
+  #define DATA_WRITE        0x00
+  #define DATA_READ         0x02
+  #define DATA_ADDR_ASC     0x00
+  #define DATA_ADDR_FIX     0x04
+  #define DATA_MODE_NORMAL  0x00
+  #define DATA_MODE_TEST    0x08
+
+  #define ADDR_BASE         0xC0
+  #define ADDR_0            0x00
+  #define ADDR_1            0x01
+  #define ADDR_2            0x02
+  #define ADDR_3            0x03
+  #define ADDR_4            0x04
+  #define ADDR_5            0x05
+
+  #define DISP_BASE         0x80
+  #define DISP_BRIGHT1      0x00
+  #define DISP_BRIGHT2      0x01
+  #define DISP_BRIGHT4      0x02
+  #define DISP_BRIGHT10     0x03
+  #define DISP_BRIGHT11     0x04
+  #define DISP_BRIGHT12     0x05
+  #define DISP_BRIGHT13     0x06
+  #define DISP_BRIGHT14     0x07
+  #define DISP_OFF          0x00
+  #define DISP_ON           0x08
+
+  void tm1637_setup() {
+    rcc_periph_clock_enable(TM1637_RCC);
+
+    gpio_mode_setup(TM1637_PORT, GPIO_MODE_OUTPUT, GPIO_PUPD_PULLUP, TM1637_CLK);
+    gpio_set_output_options(TM1637_PORT, GPIO_OTYPE_PP, GPIO_OSPEED_LOW, TM1637_CLK);
+    gpio_mode_setup(TM1637_PORT, GPIO_MODE_OUTPUT, GPIO_PUPD_PULLUP, TM1637_DIO);
+    gpio_set_output_options(TM1637_PORT, GPIO_OTYPE_OD, GPIO_OSPEED_LOW, TM1637_DIO);
+  }
+
+  static void tm1637_start(void) {
+    gpio_set(TM1637_PORT, TM1637_CLK);
+    gpio_set(TM1637_PORT, TM1637_DIO);
+    delay_us(2);
+    gpio_clear(TM1637_PORT, TM1637_DIO);
+  }
+
+  static void tm1637_ack(void) {
+    gpio_clear(TM1637_PORT, TM1637_CLK);
+    delay_us(5);
+    //while (gpio_get(TM1637_PORT, TM1637_DIO) == 1); // We're cheating here and not actually reading back the response.
+    gpio_set(TM1637_PORT, TM1637_CLK);
+    delay_us(2);
+    gpio_clear(TM1637_PORT, TM1637_CLK);
+  }
+
+  static void tm1637_stop(void) {
+    gpio_clear(TM1637_PORT, TM1637_CLK);
+    delay_us(2);
+    gpio_clear(TM1637_PORT, TM1637_DIO);
+    delay_us(2);
+    gpio_set(TM1637_PORT, TM1637_CLK);
+    delay_us(2);
+    gpio_set(TM1637_PORT, TM1637_DIO);
+  }
+
+  static void tm1637_write(const uint8_t byte) {
+    for (uint8_t i = 0; i < 8; i ++) {
+      gpio_clear(TM1637_PORT, TM1637_CLK);
+      if ((byte >> i) & 0x01) {
+        gpio_set(TM1637_PORT, TM1637_DIO);
+      } else {
+        gpio_clear(TM1637_PORT, TM1637_DIO);
+      }
+      delay_us(3);
+      gpio_set(TM1637_PORT, TM1637_CLK);
+      delay_us(3);
+    }
+  }
+
+  void tm1637_display(const uint8_t seg, const uint8_t data) {
+    tm1637_start();
+    tm1637_write(DATA_BASE | DATA_WRITE | DATA_ADDR_FIX);
+    tm1637_ack();
+    tm1637_stop();
+    tm1637_start();
+    switch (seg) {
+    case 2:
+      tm1637_write(ADDR_BASE | ADDR_1);
+      break;
+    case 3:
+      tm1637_write(ADDR_BASE | ADDR_2);
+      break;
+    case 4:
+      tm1637_write(ADDR_BASE | ADDR_3);
+      break;
+    case 5:
+      tm1637_write(ADDR_BASE | ADDR_4);
+      break;
+    case 6:
+      tm1637_write(ADDR_BASE | ADDR_5);
+      break;
+    default:
+      tm1637_write(ADDR_BASE | ADDR_0);
+      break;
+    }
+    tm1637_ack();
+    tm1637_write(data);
+    tm1637_ack();
+    tm1637_stop();
+    tm1637_start();
+    tm1637_write(DISP_BASE | DISP_ON | DISP_BRIGHT14);
+    tm1637_ack();
+    tm1637_stop();
+  }
+
+  void tm1637_display6(const uint8_t data[6]) {
+    tm1637_start();
+    tm1637_write(DATA_BASE | DATA_WRITE | DATA_ADDR_ASC);
+    tm1637_ack();
+    tm1637_stop();
+    tm1637_start();
+    tm1637_write(ADDR_BASE);
+    tm1637_ack();
+    for (uint8_t i = 0; i < 6; i ++) {
+      tm1637_write(data[i]);
+      tm1637_ack();
+    }
+    tm1637_stop();
+    tm1637_start();
+    tm1637_write(DISP_BASE | DISP_ON | DISP_BRIGHT14);
+    tm1637_ack();
+    tm1637_stop();
+  }
+
+  uint8_t tm1637_scan_key() {
+    uint8_t key = 0;
+    tm1637_start();
+    tm1637_write(DATA_BASE | DATA_READ);
+    tm1637_ack();
+    gpio_set(TM1637_PORT, TM1637_DIO);
+    for (uint8_t i = 0; i < 8; i ++) {
+      gpio_clear(TM1637_PORT, TM1637_CLK);
+      key = key >> 1;
+      delay_us(30);
+      gpio_set(TM1637_PORT, TM1637_CLK);
+      if (gpio_get(TM1637_PORT, TM1637_DIO) != 0) {
+        key = key | 0x80;
+      } else {
+        key = key | 0x00;
+      }
+      delay_us(30);
+    }
+    tm1637_ack();
+    tm1637_stop();
+    return key;
+  }
+#+end_src
+** LED
+#+begin_src c :tangle /dev/shm/card-reader/led.h
+  #ifndef _LED_H
+  #define _LED_H
+
+  void led_setup(void);
+  void led_on(void);
+  void led_off(void);
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/card-reader/led.c
+  #include <libopencm3/stm32/rcc.h>
+  #include <libopencm3/stm32/gpio.h>
+  #include "led.h"
+  #include "defination.h"
+
+  void led_setup() {
+    rcc_periph_clock_enable(LED_RCC);
+
+    gpio_mode_setup(LED_PORT, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, LED_IO);
+  }
+
+  void led_on() {
+    gpio_set(LED_PORT, LED_IO);
+  }
+
+  void led_off() {
+    gpio_clear(LED_PORT, LED_IO);
+  }
+#+end_src
+** MP3
+#+begin_src c :tangle /dev/shm/card-reader/speaker.h
+  #ifndef _SPEAKER_H
+  #define _SPEAKER_H
+  #include <stdint.h>
+  void speaker_setup(void);
+  void speaker_eventloop(void);
+  void speaker_play(uint16_t idx);
+  void speaker_volume_up(void);
+  void speaker_volume_down(void);
+  void speaker_volume(uint8_t vol);
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/card-reader/speaker.c
+  #include <libopencm3/stm32/rcc.h>
+  #include <libopencm3/stm32/gpio.h>
+  #include <libopencm3/stm32/timer.h>
+  #include <libopencm3/cm3/nvic.h>
+  #include "speaker.h"
+  #include "defination.h"
+  #include "utility.h"
+  #include "ring.h"
+
+  #define SPEAKER_BUFFER_BITSIZE 4
+
+  struct ring_t speaker_tx;
+  uint8_t speaker_tx_buffer[2 << (SPEAKER_BUFFER_BITSIZE - 1)];
+
+  static volatile uint8_t count_to_send = 0; // count of bit to send
+  static volatile uint16_t data = 0;
+
+  static void speaker_write(uint8_t byte) {
+    while (count_to_send != 0);
+    data = ((((uint16_t)byte) << 1) | 0x0200);
+    count_to_send = 10;
+  }
+
+  void speaker_setup(void) {
+
+    ring_init(&speaker_tx, speaker_tx_buffer, SPEAKER_BUFFER_BITSIZE);
+
+    rcc_periph_clock_enable(SPEAKER_TIM_RCC);
+    rcc_periph_clock_enable(SPEAKER_GPIO_RCC);
+
+    gpio_mode_setup(SPEAKER_PORT, GPIO_MODE_OUTPUT, GPIO_PUPD_PULLUP, SPEAKER_IO);
+    gpio_set_output_options(SPEAKER_PORT, GPIO_OTYPE_PP, GPIO_OSPEED_HIGH, SPEAKER_IO);
+
+    /* Reset TIM2 peripheral to defaults. */
+    rcc_periph_reset_pulse(SPEAKER_TIM_RST);
+
+    timer_set_mode(SPEAKER_TIM, TIM_CR1_CKD_CK_INT, TIM_CR1_CMS_EDGE, TIM_CR1_DIR_UP);
+
+    timer_set_prescaler(SPEAKER_TIM, 499);
+
+    timer_set_period(SPEAKER_TIM, 9);
+
+    /* Enable TIM2 interrupt. */
+
+    nvic_enable_irq(SPEAKER_NVIC_IRQ);
+    timer_enable_update_event(SPEAKER_TIM); /* default at reset! */
+    timer_enable_irq(SPEAKER_TIM, TIM_DIER_UIE);
+    timer_enable_counter(SPEAKER_TIM);
+
+    speaker_play(1); // make speaker work immediately
+  }
+
+  void speaker_play(uint16_t idx) {
+    uint8_t cmd[] = { 0x7E, 0x05, 0x41, 0x00, 0x00, 0x00, 0xEF };
+    cmd[3] = (idx >> 8) & 0xFF;
+    cmd[4] = (idx >> 0) & 0xFF;
+    cmd[5] = cmd[1] ^ cmd[2] ^ cmd[3] ^ cmd[4];
+    ring_write_array(&speaker_tx, cmd, 0, 7);
+  }
+
+  void speaker_volume_up() {
+    uint8_t cmd[] = { 0x7E, 0x03, 0x15, 0x16, 0xEF };
+    ring_write_array(&speaker_tx, cmd, 0, 5);
+  }
+
+  void speaker_volume_down() {
+    uint8_t cmd[] = { 0x7E, 0x03, 0x16, 0x15, 0xEF };
+    ring_write_array(&speaker_tx, cmd, 0, 5);
+  }
+
+  void speaker_volume(uint8_t vol) {
+    uint8_t cmd[] = { 0x7E, 0x04, 0x31, 0x00, 0x00, 0xEF };
+    cmd[3] = vol;
+    cmd[4] = cmd[1] ^ cmd[2] ^ cmd[3];
+    ring_write_array(&speaker_tx, cmd, 0, 6);
+  }
+
+  void speaker_eventloop(void) {
+    if (ring_length(&speaker_tx) > 0) {
+      uint8_t byte = 0;
+      if (ring_read(&speaker_tx, &byte) != 0) {
+        speaker_write(byte);
+      }
+    }
+  }
+
+  void tim2_isr(void) {
+    if (TIM_SR(SPEAKER_TIM) & TIM_SR_UIF) {
+      if (count_to_send == 0) {
+        TIM_SR(SPEAKER_TIM) &= ~TIM_SR_UIF;
+        return;
+      }
+      if ((data & 0x01) == 0) {
+        gpio_clear(SPEAKER_PORT, SPEAKER_IO);
+      } else {
+        gpio_set(SPEAKER_PORT, SPEAKER_IO);
+      }
+      data >>= 1;
+      count_to_send --;
+      TIM_SR(SPEAKER_TIM) &= ~TIM_SR_UIF;
+    }
+  }
+#+end_src
