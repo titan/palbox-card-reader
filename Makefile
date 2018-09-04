@@ -1,6 +1,8 @@
 NAME = card-reader
 BUILDDIR=/dev/shm/$(NAME)
 TARGET = $(BUILDDIR)/$(NAME).elf
+DATE=$(shell git log -n 1 --date=short --pretty=format:%cd)
+COMMIT=$(shell git log -n 1 --pretty=format:%h)
 
 BUILDSRC:=$(BUILDDIR)/Makefile
 CORESRC:=$(BUILDDIR)/card-reader.c
@@ -20,7 +22,7 @@ include .config
 
 all: $(TARGET)
 
-release: $(BUILDDIR)/card-reader-tm1637-1.bin $(BUILDDIR)/card-reader-tm1637-2.bin $(BUILDDIR)/card-reader-tm1637-3.bin $(BUILDDIR)/card-reader-tm1650-1.bin $(BUILDDIR)/card-reader-tm1650-2.bin $(BUILDDIR)/card-reader-tm1650-3.bin
+release: /dev/shm/card-reader-tm1637-1-$(COMMIT)-$(DATE).bin /dev/shm/card-reader-tm1637-2-$(COMMIT)-$(DATE).bin /dev/shm/card-reader-tm1637-3-$(COMMIT)-$(DATE).bin /dev/shm/card-reader-tm1650-1-$(COMMIT)-$(DATE).bin /dev/shm/card-reader-tm1650-2-$(COMMIT)-$(DATE).bin /dev/shm/card-reader-tm1650-3-$(COMMIT)-$(DATE).bin
 
 $(TARGET): $(BUILDSRC) $(CORESRC) $(EPIGYNYSRC) $(DRIVERSRC) $(UTILSRC) $(PROTOSRC) $(COMMONPROTOSRC) $(LIBRARY) $(COREFSMSRC) $(PROTOFSMSRC) $(CONFIGSRC) $(WIEGANDFSMSRC)
 	sed 's/\$${ID}/$(ID)/g' $(CONFIGSRC) | sed 's/\$${LED}/$(LED)/g' > $(CONFIG)
@@ -69,32 +71,32 @@ flash: $(TARGET)
 	cd $(BUILDDIR); make flash V=1; cd -
 
 
-$(BUILDDIR)/card-reader-tm1637-1.bin: $(BUILDSRC) $(CORESRC) $(EPIGYNYSRC) $(DRIVERSRC) $(UTILSRC) $(PROTOSRC) $(COMMONPROTOSRC) $(LIBRARY) $(COREFSMSRC) $(PROTOFSMSRC) $(CONFIGSRC) $(WIEGANDFSMSRC)
+/dev/shm/card-reader-tm1637-1-$(COMMIT)-$(DATE).bin: $(BUILDSRC) $(CORESRC) $(EPIGYNYSRC) $(DRIVERSRC) $(UTILSRC) $(PROTOSRC) $(COMMONPROTOSRC) $(LIBRARY) $(COREFSMSRC) $(PROTOFSMSRC) $(CONFIGSRC) $(WIEGANDFSMSRC)
 	sed 's/\$${ID}/1/g' $(CONFIGSRC) | sed 's/\$${LED}/TM1637/g' > $(CONFIG)
 	cd $(BUILDDIR); make clean; make bin; cd -
 	cp $(BUILDDIR)/$(NAME).bin $@
 
-$(BUILDDIR)/card-reader-tm1637-2.bin: $(BUILDSRC) $(CORESRC) $(EPIGYNYSRC) $(DRIVERSRC) $(UTILSRC) $(PROTOSRC) $(COMMONPROTOSRC) $(LIBRARY) $(COREFSMSRC) $(PROTOFSMSRC) $(CONFIGSRC) $(WIEGANDFSMSRC)
+/dev/shm/card-reader-tm1637-2-$(COMMIT)-$(DATE).bin: $(BUILDSRC) $(CORESRC) $(EPIGYNYSRC) $(DRIVERSRC) $(UTILSRC) $(PROTOSRC) $(COMMONPROTOSRC) $(LIBRARY) $(COREFSMSRC) $(PROTOFSMSRC) $(CONFIGSRC) $(WIEGANDFSMSRC)
 	sed 's/\$${ID}/2/g' $(CONFIGSRC) | sed 's/\$${LED}/TM1637/g' > $(CONFIG)
 	cd $(BUILDDIR); make clean; make bin; cd -
 	cp $(BUILDDIR)/$(NAME).bin $@
 
-$(BUILDDIR)/card-reader-tm1637-3.bin: $(BUILDSRC) $(CORESRC) $(EPIGYNYSRC) $(DRIVERSRC) $(UTILSRC) $(PROTOSRC) $(COMMONPROTOSRC) $(LIBRARY) $(COREFSMSRC) $(PROTOFSMSRC) $(CONFIGSRC) $(WIEGANDFSMSRC)
+/dev/shm/card-reader-tm1637-3-$(COMMIT)-$(DATE).bin: $(BUILDSRC) $(CORESRC) $(EPIGYNYSRC) $(DRIVERSRC) $(UTILSRC) $(PROTOSRC) $(COMMONPROTOSRC) $(LIBRARY) $(COREFSMSRC) $(PROTOFSMSRC) $(CONFIGSRC) $(WIEGANDFSMSRC)
 	sed 's/\$${ID}/3/g' $(CONFIGSRC) | sed 's/\$${LED}/TM1637/g' > $(CONFIG)
 	cd $(BUILDDIR); make clean; make bin; cd -
 	cp $(BUILDDIR)/$(NAME).bin $@
 
-$(BUILDDIR)/card-reader-tm1650-1.bin: $(BUILDSRC) $(CORESRC) $(EPIGYNYSRC) $(DRIVERSRC) $(UTILSRC) $(PROTOSRC) $(COMMONPROTOSRC) $(LIBRARY) $(COREFSMSRC) $(PROTOFSMSRC) $(CONFIGSRC) $(WIEGANDFSMSRC)
+/dev/shm/card-reader-tm1650-1-$(COMMIT)-$(DATE).bin: $(BUILDSRC) $(CORESRC) $(EPIGYNYSRC) $(DRIVERSRC) $(UTILSRC) $(PROTOSRC) $(COMMONPROTOSRC) $(LIBRARY) $(COREFSMSRC) $(PROTOFSMSRC) $(CONFIGSRC) $(WIEGANDFSMSRC)
 	sed 's/\$${ID}/1/g' $(CONFIGSRC) | sed 's/\$${LED}/TM1650/g' > $(CONFIG)
 	cd $(BUILDDIR); make clean; make bin; cd -
 	cp $(BUILDDIR)/$(NAME).bin $@
 
-$(BUILDDIR)/card-reader-tm1650-2.bin: $(BUILDSRC) $(CORESRC) $(EPIGYNYSRC) $(DRIVERSRC) $(UTILSRC) $(PROTOSRC) $(COMMONPROTOSRC) $(LIBRARY) $(COREFSMSRC) $(PROTOFSMSRC) $(CONFIGSRC) $(WIEGANDFSMSRC)
+/dev/shm/card-reader-tm1650-2-$(COMMIT)-$(DATE).bin: $(BUILDSRC) $(CORESRC) $(EPIGYNYSRC) $(DRIVERSRC) $(UTILSRC) $(PROTOSRC) $(COMMONPROTOSRC) $(LIBRARY) $(COREFSMSRC) $(PROTOFSMSRC) $(CONFIGSRC) $(WIEGANDFSMSRC)
 	sed 's/\$${ID}/2/g' $(CONFIGSRC) | sed 's/\$${LED}/TM1650/g' > $(CONFIG)
 	cd $(BUILDDIR); make clean; make bin; cd -
 	cp $(BUILDDIR)/$(NAME).bin $@
 
-$(BUILDDIR)/card-reader-tm1650-3.bin: $(BUILDSRC) $(CORESRC) $(EPIGYNYSRC) $(DRIVERSRC) $(UTILSRC) $(PROTOSRC) $(COMMONPROTOSRC) $(LIBRARY) $(COREFSMSRC) $(PROTOFSMSRC) $(CONFIGSRC) $(WIEGANDFSMSRC)
+/dev/shm/card-reader-tm1650-3-$(COMMIT)-$(DATE).bin: $(BUILDSRC) $(CORESRC) $(EPIGYNYSRC) $(DRIVERSRC) $(UTILSRC) $(PROTOSRC) $(COMMONPROTOSRC) $(LIBRARY) $(COREFSMSRC) $(PROTOFSMSRC) $(CONFIGSRC) $(WIEGANDFSMSRC)
 	sed 's/\$${ID}/3/g' $(CONFIGSRC) | sed 's/\$${LED}/TM1650/g' > $(CONFIG)
 	cd $(BUILDDIR); make clean; make bin; cd -
 	cp $(BUILDDIR)/$(NAME).bin $@
