@@ -122,7 +122,10 @@
         tx_to_send = len;
       }
     } else if (systick >= slot && systick <= (slot + SLOT_LEN - (tx_to_send << 1))) {
+      gpio_set(FLOW_PORT, FLOW_IO);
       USART_CR1(USART_EPIGYNY) |= USART_CR1_TXEIE;
+    } else {
+      gpio_clear(FLOW_PORT, FLOW_IO);
     }
 
     if (ring_length(&epigyny_rx) > 0) {
