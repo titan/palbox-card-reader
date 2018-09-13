@@ -26,6 +26,9 @@ release: /dev/shm/card-reader-tm1637-1-$(COMMIT)-$(DATE).bin /dev/shm/card-reade
 
 $(TARGET): $(BUILDSRC) $(CORESRC) $(EPIGYNYSRC) $(DRIVERSRC) $(UTILSRC) $(PROTOSRC) $(COMMONPROTOSRC) $(LIBRARY) $(COREFSMSRC) $(PROTOFSMSRC) $(CONFIGSRC) $(WIEGANDFSMSRC)
 	sed 's/\$${ID}/$(ID)/g' $(CONFIGSRC) | sed 's/\$${LED}/$(LED)/g' > $(CONFIG)
+ifdef ATTACKING_MODE
+	sed -i 'a \ATTACKING_MODE=1' $(CONFIG)
+endif
 	cd $(BUILDDIR); make; cd -
 
 $(CORESRC): core.org | prebuild

@@ -130,12 +130,16 @@
 
     uint32_t loop_timer = 0;
 
+  #ifdef ATTACKING_MODE
+    uint32_t cardno = 0;
+  #endif
+
     while (1) {
       epigyny_eventloop();
       wiegand_eventloop();
       speaker_eventloop();
-      if (systick - loop_timer > 999) {
-        loop_timer = systick;
+      if (systick > loop_timer) {
+        loop_timer = systick + 999;
         if (card_reader_state == CARD_READER_REQUESTING_STATE) {
           if (systick - request_timer > 2999) {
             card_reader_state = card_reader_transform_state(card_reader_state, CARD_READER_TIMEOUT_EVENT, NULL);
@@ -171,6 +175,31 @@
             card_reader_state = card_reader_transform_state(card_reader_state, CARD_READER_TIMEOUT_EVENT, NULL);
           }
         }
+
+  #ifdef ATTACKING_MODE
+        switch (((systick / 1000) & 0x0F)) {
+        case 0:
+          cardno = rand() % 1000000;
+          card_reader_state = card_reader_transform_state(card_reader_state, CARD_READER_CARD_EVENT, &cardno);
+          break;
+        case 2: {
+          uint8_t key = rand() % 10;
+          card_reader_state = card_reader_transform_state(card_reader_state, CARD_READER_NUMBER_EVENT, &key);
+          break;
+        }
+        case 4:
+          card_reader_state = card_reader_transform_state(card_reader_state, CARD_READER_ENTER_EVENT, NULL);
+          break;
+        case 9:
+          card_reader_state = card_reader_transform_state(card_reader_state, CARD_READER_CARD_EVENT, &cardno);
+          break;
+        case 10:
+          card_reader_state = card_reader_transform_state(card_reader_state, CARD_READER_ENTER_EVENT, NULL);
+          break;
+        default:
+          break;
+        }
+  #endif
         if (((systick / 1000) & 0x01) == 0) {
           card_reader_state = card_reader_transform_state(card_reader_state, CARD_READER_YIN_TICK_EVENT, NULL);
         } else {
