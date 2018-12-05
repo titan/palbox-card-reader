@@ -137,16 +137,12 @@
       uint8_t byte;
       ring_read(&epigyny_rx, &byte);
       ctx->byte = byte;
-      if (byte < 0x5A) {
-        proto_state = proto_transform_state(proto_state, PROTO_0X00_0X59_EVENT, ctx);
-      } else if (byte == 0x5A) {
+      if (byte == 0x5A) {
         proto_state = proto_transform_state(proto_state, PROTO_0X5A_EVENT, ctx);
-      } else if (0x5A < byte && byte < 0xA5) {
-        proto_state = proto_transform_state(proto_state, PROTO_0X5B_0XA4_EVENT, ctx);
       } else if (byte == 0xA5) {
         proto_state = proto_transform_state(proto_state, PROTO_0XA5_EVENT, ctx);
-      } else if (0xA5 < byte) {
-        proto_state = proto_transform_state(proto_state, PROTO_0XA6_0XFF_EVENT, ctx);
+      } else {
+        proto_state = proto_transform_state(proto_state, PROTO_OTHERS_EVENT, ctx);
       }
       if (ctx->countdown == 0) {
         proto_state = proto_transform_state(proto_state, PROTO_COUNTDOWN_EQUALS_0_EVENT, ctx);

@@ -407,7 +407,7 @@
   #endif
       speaker_play(number1 + 30);
       break;
-    case CARD_READER_NUMBER_1_ASSIGN_TO_NUMBER_2_NEWLINE_NUMBER_2_ASSIGN_TO_0_NEWLINE_ACTION:
+    case CARD_READER_NUMBER_1_ASSIGN_TO_NUMBER_2_NEWLINE_NUMBER_2_ASSIGN_TO_0_ACTION:
       number1 = number2;
       number2 = 0;
   #ifdef TM1637
@@ -434,7 +434,7 @@
   #endif
       speaker_play(number1 + 30);
       break;
-    case CARD_READER_NUMBER_1_ASSIGN_TO_NUMBER_2_NEWLINE_NUMBER_2_ASSIGN_TO_NUMBER_3_NEWLINE_NUMBER_3_ASSIGN_TO_0_NEWLINE_ACTION:
+    case CARD_READER_NUMBER_1_ASSIGN_TO_NUMBER_2_NEWLINE_NUMBER_2_ASSIGN_TO_NUMBER_3_NEWLINE_NUMBER_3_ASSIGN_TO_0_ACTION:
       number1 = number2;
       number2 = number3;
       number3 = 0;
@@ -447,7 +447,7 @@
       segment_led_display(4, encode_decimal(number1));
   #endif
       break;
-    case CARD_READER_NUMBER_1_ASSIGN_TO_NUMBER_2_NEWLINE_NUMBER_2_ASSIGN_TO_NUMBER_3_NEWLINE_NUMBER_3_ASSIGN_TO_NUMBER_4_NEWLINE_NUMBER_4_ASSIGN_TO_0_NEWLINE_ACTION:
+    case CARD_READER_NUMBER_1_ASSIGN_TO_NUMBER_2_NEWLINE_NUMBER_2_ASSIGN_TO_NUMBER_3_NEWLINE_NUMBER_3_ASSIGN_TO_NUMBER_4_NEWLINE_NUMBER_4_ASSIGN_TO_0_ACTION:
       number1 = number2;
       number2 = number3;
       number3 = number4;

@@ -43,13 +43,13 @@ $(DRIVERSRC): driver.org | prebuild
 $(UTILSRC): utility.org | prebuild
 	org-tangle $<
 
-$(COREFSMSRC): card-reader-fsm.xlsx | prebuild
+$(COREFSMSRC): card-reader-fsm.txt | prebuild
 	fsm-generator.py $< -d $(BUILDDIR) --prefix card-reader --style table
 
-$(PROTOFSMSRC): proto-fsm.xlsx | prebuild
+$(PROTOFSMSRC): proto-fsm.txt | prebuild
 	fsm-generator.py $< -d $(BUILDDIR) --prefix proto --style table
 
-$(WIEGANDFSMSRC): wiegand-fsm.xlsx | prebuild
+$(WIEGANDFSMSRC): wiegand-fsm.txt | prebuild
 	fsm-generator.py $< -d $(BUILDDIR) --prefix wiegand --style code
 
 $(BUILDSRC): build.org | prebuild
